@@ -1,6 +1,7 @@
 # Build output
 build/
-passwdmngr-server
+passwdmngrd
+client
 
 # Object files
 *.o

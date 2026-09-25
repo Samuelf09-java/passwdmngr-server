@@ -1,0 +1,14 @@
+[Unit]
+Description=Passwordd Manager Server (testing)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/samuelf09/passwdmngr-server/passwdmngrd
+Restart=on-failure
+User=root
+WorkingDirectory=/usr/local/bin
+StateDirectory=passwdmngrd
+
+[Install]
+WantedBy=multi-user.target
