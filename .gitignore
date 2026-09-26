@@ -35,3 +35,6 @@ Thumbs.db
 *.old
 *.tmp
 *.bck
+
+ca.crt
+packaging/passwdmngrd.service

@@ -11,6 +11,20 @@ SERVER_OBJS := $(SERVER_SRCS:src/%.c=build/%.o)
 
 TARGET ?= passwdmngrd
 
+SERVER_THREADS_QUEUE ?= 4:128
+
+NUM_THREADS := $(word 1,$(subst :, ,$(SERVER_THREADS_QUEUE)))
+QUEUE_SIZE  := $(word 2,$(subst :, ,$(SERVER_THREADS_QUEUE)))
+
+CFLAGS += -DNUM_THREADS=$(NUM_THREADS) -DQUEUE_SIZE=$(QUEUE_SIZE)
+
+# set to 'true' to remove os/hardware details from server info line
+NO_DETAILED_SERVER_INFO ?= false
+
+ifeq ($(NO_DETAILED_SERVER_INFO),true)
+	CFLAGS += -DNO_DETAILED_SERVER_INFO
+endif
+
 all: $(TARGET)
 
 # Compile server
@@ -24,14 +38,9 @@ $(TARGET): $(SERVER_OBJS)
 	@echo "Linking object files into executable '$(TARGET)'"
 	@$(CC) $(SERVER_OBJS) -o $(TARGET) $(LDLIBS)
 
-build/client.o: src/client.c
-	@mkdir -p $(dir $@)
-	@echo "CC $<"
-	@$(CC) $(CFLAGS) -c $< -o $@
-
-client: build/client.o $(TARGET)
+client: build/client.o build/cJSON.o $(TARGET)
 	@echo "Linking object files into executable 'client'"
-	@$(CC) build/client.o -o client $(LDLIBS)
+	@$(CC) build/client.o build/cJSON.o -o client $(LDLIBS)
 	@echo "Done"
 
 clean:
@@ -51,6 +60,38 @@ install: $(TARGET)
 		echo "Error: make install must be run as root"; \
 		exit 1; \
 	fi
+
+	@mkdir -p /etc/passwdmngrd
+
+	@if [ ! -f /etc/passwdmngrd/ca.key ]; then \
+		echo "Creating CA..."; \
+		openssl genrsa -out /etc/passwdmngrd/ca.key 4096; \
+		openssl req -x509 -new -nodes -key /etc/passwdmngrd/ca.key \
+			-sha256 -days 3650 \
+			-out /etc/passwdmngrd/ca.crt \
+			-subj "/C=US/ST=./L=./O=passwdmngrd/OU=./CN=passwdmngr-server CA"; \
+	fi
+
+	@if [ ! -f /etc/passwdmngrd/server.key ]; then \
+		echo "Creating server key..."; \
+		openssl genrsa -out /etc/passwdmngrd/server.key 4096; \
+	fi
+
+	@echo "Creating CSR..."
+	@openssl req -new \
+		-key /etc/passwdmngrd/server.key \
+		-out /etc/passwdmngrd/server.csr \
+		-subj "/C=US/ST=./L=./O=passwdmngrd/OU=./CN=$$(hostname)"
+
+	@echo "Signing CSR..."
+	@openssl x509 -req \
+		-in /etc/passwdmngrd/server.csr \
+		-CA /etc/passwdmngrd/ca.crt \
+		-CAkey /etc/passwdmngrd/ca.key \
+		-CAcreateserial \
+		-out /etc/passwdmngrd/server.crt \
+		-days 365 \
+		-sha256
 
 	@echo "Installing $(TARGET) to $(BINDIR)"
 	@install -d $(BINDIR)
@@ -88,5 +129,8 @@ uninstall:
 
 	@echo "Removing persistent directories"
 	@rm -rf $(LIBDIR)
+
+	@echo "Leaving TLS certificates in /etc/passwdmngrd."
+
 
 	@echo "Uninstall complete"

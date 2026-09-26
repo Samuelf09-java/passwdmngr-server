@@ -1,0 +1,2 @@
+#define PORT 7443
+#define SERVER_VERSION 1.0
