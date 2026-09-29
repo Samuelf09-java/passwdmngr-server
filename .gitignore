@@ -37,4 +37,3 @@ Thumbs.db
 *.bck
 
 ca.crt
-packaging/passwdmngrd.service

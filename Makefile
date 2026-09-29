@@ -1,9 +1,9 @@
 CC ?= gcc
 
 CFLAGS = -Wall -Wextra -O2 -I./include
-# CFLAGS += $(shell pkg-config --cflags <libs>)
+CFLAGS += $(shell pkg-config --cflags libcurl)
 
-LDLIBS := -lsodium -lcrypto -lssl
+LDLIBS := -lsodium -lcrypto -lssl -lcurl
 
 SERVER_SRCS := $(wildcard src/*.c)
 SERVER_SRCS := $(filter-out src/client.c, $(SERVER_SRCS))
@@ -25,6 +25,10 @@ ifeq ($(NO_DETAILED_SERVER_INFO),true)
 	CFLAGS += -DNO_DETAILED_SERVER_INFO
 endif
 
+ifneq ($(PORT),)
+    CFLAGS += -DPORT=$(PORT)
+endif
+
 all: $(TARGET)
 
 # Compile server
@@ -38,7 +42,7 @@ $(TARGET): $(SERVER_OBJS)
 	@echo "Linking object files into executable '$(TARGET)'"
 	@$(CC) $(SERVER_OBJS) -o $(TARGET) $(LDLIBS)
 
-client: build/client.o build/cJSON.o $(TARGET)
+client: build/client.o build/cJSON.o
 	@echo "Linking object files into executable 'client'"
 	@$(CC) build/client.o build/cJSON.o -o client $(LDLIBS)
 	@echo "Done"
@@ -53,6 +57,7 @@ LIBDIR := /var/lib/passwdmngrd
 VAULTDIR := $(LIBDIR)/vaults
 SYSDDIR := /etc/systemd/system
 SERVICE := passwdmngrd.service
+SMTP_FILE := smtp.conf
 
 
 install: $(TARGET)
@@ -100,6 +105,7 @@ install: $(TARGET)
 	@echo "Creating persistent directories"
 	@install -d -m 755 $(LIBDIR)
 	@install -d -m 700 $(VAULTDIR)
+	@install -m 644 packaging/$(SMTP_FILE) $(LIBDIR)/$(SMTP_FILE)
 
 	@echo "Installing systemd service"
 	@install -d $(SYSDDIR)
