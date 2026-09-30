@@ -408,9 +408,8 @@ int main() {
     randombytes_buf(auth_pk, sizeof(auth_pk));
 
     if (remote_create_account("test@example.com", username_hash, password_hash, auth_pk) == -5) {
-        request_code_resend("test@example.com");
         // server emailed verification code; get it from user and enter it here
-        finish_create_account(725698, "test@example.com");
+        finish_create_account(425828, "test@example.com");
     }
 
     pwmngr_disconnect();

@@ -1,9 +1,10 @@
 CC ?= gcc
 
-CFLAGS = -Wall -Wextra -O2 -I./include
+CFLAGS = -Wall -Wextra -O2 -I./include -g
 CFLAGS += $(shell pkg-config --cflags libcurl)
 
-LDLIBS := -lsodium -lcrypto -lssl -lcurl
+LDLIBS := -L./lib -lsodium -lcrypto -lssl -lcurl -lvldmail
+
 
 SERVER_SRCS := $(wildcard src/*.c)
 SERVER_SRCS := $(filter-out src/client.c, $(SERVER_SRCS))
@@ -27,6 +28,10 @@ endif
 
 ifneq ($(PORT),)
     CFLAGS += -DPORT=$(PORT)
+endif
+
+ifneq ($(SAVE_INTERVAL_MINUTES),)
+    CFLAGS += -DSAVE_INTERVAL_MINUTES=$(SAVE_INTERVAL_MINUTES)
 endif
 
 all: $(TARGET)

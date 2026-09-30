@@ -1,5 +1,6 @@
 #include "server.h"
 #include "cJSON.h"
+#include "vldmail.h"
 #include <arpa/inet.h>
 #include <curl/curl.h>
 #include <fcntl.h>
@@ -28,6 +29,8 @@
 #ifndef SERVER_INFO
 #define SERVER_INFO "Password Manager Server - version 1.0"
 #endif
+
+#define MAX(a, b) (a > b ? a : b)
 
 enum LogLevel { PLOG_DEBUG, PLOG_INFO, PLOG_WARN, PLOG_ERROR, PLOG_FATAL };
 typedef enum LogLevel LogLevel;
@@ -224,6 +227,8 @@ typedef struct __attribute__((packed)) ServerAccount {
     uint8_t  uname_hash[UNAME_HASH_LEN];
     uint8_t  passwd_hash[PASSWD_HASH_LEN];
     uint8_t  auth_pk[AUTH_PK_LEN];
+    uint16_t email_len;
+    char    *email;
 } ServerAccount;
 
 typedef struct __attribute__((packed)) TokenFileHeader {
@@ -239,12 +244,6 @@ typedef struct __attribute__((packed)) AuthToken {
     uint32_t user_id;
 } AuthToken;
 
-typedef struct __attribute__((packed)) UserEmail {
-    uint32_t user_id;
-    uint16_t email_len;
-    char    *email;
-} UserEmail;
-
 typedef struct SmtpConfig {
     int   use_smtp_verification;
     char *smtp_host;
@@ -256,7 +255,6 @@ typedef struct SmtpConfig {
 } SmtpConfig;
 
 typedef struct EmailVerificationCode {
-    char          *email;
     int            code;
     time_t         expire_time;
     ServerAccount *new_acc;
@@ -272,10 +270,10 @@ pthread_mutex_t        verification_codes_lock = PTHREAD_MUTEX_INITIALIZER;
 ServerAccount *accounts          = NULL;
 int            num_accounts      = 0;
 int            accounts_modified = 0;
-UserEmail     *user_emails       = NULL;
-AuthToken     *tokens            = NULL;
-int            num_tokens        = 0;
-int            tokens_modified   = 0;
+// UserEmail     *user_emails       = NULL;
+AuthToken *tokens          = NULL;
+int        num_tokens      = 0;
+int        tokens_modified = 0;
 
 pthread_mutex_t accounts_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t tokens_lock   = PTHREAD_MUTEX_INITIALIZER;
@@ -338,15 +336,15 @@ int load_smtp_config() {
     return 0;
 }
 
-void free_emails() {
+void free_accounts() {
     pthread_mutex_lock(&accounts_lock);
-    if (!user_emails)
+    if (!accounts)
         return;
     for (int i = 0; i < num_accounts; i++)
-        if (user_emails[i].email)
-            free(user_emails[i].email);
-    free(user_emails);
-    pthread_mutex_lock(&accounts_lock);
+        if (accounts[i].email)
+            free(accounts[i].email);
+    free(accounts);
+    pthread_mutex_unlock(&accounts_lock);
 }
 
 int save_accounts() {
@@ -362,7 +360,7 @@ int save_accounts() {
 
     hdr->num_accounts = num_accounts;
 
-    int      email_space = (sizeof(UserEmail) + 17) * num_accounts;
+    int      email_space = (sizeof(uint16_t) + 25) * num_accounts;
     int      write_len   = sizeof(ServerAccountHeader);
     uint8_t *write_buf =
         ec_realloc(hdr, sizeof(ServerAccountHeader) + (sizeof(ServerAccount) * num_accounts) + email_space);
@@ -377,17 +375,17 @@ int save_accounts() {
     int written_email_len = 0;
 
     for (int i = 0; i < num_accounts; i++) {
-        if (email_space < (int64_t)(sizeof(UserEmail) - sizeof(char *) + strlen(user_emails[i].email))) {
+        if (email_space < (int64_t)(sizeof(uint16_t) + accounts[i].email_len)) {
             // allocate space for ~ten more emails
-            email_space += (sizeof(UserEmail) + 17) * 10;
+            email_space += ((sizeof(uint16_t) + 25)) * 10;
             write_buf = ec_realloc(write_buf, write_len + email_space);
         }
 
-        memcpy(write_buf + write_len + written_email_len, &user_emails[i], sizeof(UserEmail) - sizeof(char *));
-        written_email_len += sizeof(UserEmail) - sizeof(char *);
+        memcpy(write_buf + write_len + written_email_len, &accounts[i].email_len, sizeof(uint16_t));
+        written_email_len += sizeof(uint16_t);
 
-        memcpy(write_buf + write_len + written_email_len, user_emails[i].email, strlen(user_emails[i].email));
-        written_email_len += strlen(user_emails[i].email);
+        memcpy(write_buf + write_len + written_email_len, accounts[i].email, accounts[i].email_len);
+        written_email_len += accounts[i].email_len;
     }
 
     pthread_mutex_unlock(&accounts_lock);
@@ -417,6 +415,92 @@ int save_accounts() {
     accounts_modified = 0;
 
     return 0; // success
+}
+
+uint32_t get_next_user_id() {
+    uint32_t id = 0;
+
+    pthread_mutex_lock(&accounts_lock);
+    for (int i = 0; i < num_accounts; i++)
+        id = MAX(id, accounts[i].user_id);
+    pthread_mutex_unlock(&accounts_lock);
+
+    return ++id;
+}
+
+// returns pointer to the token in the tokens array; caller is responsible for locks
+uint8_t *assign_token(uint32_t user_id) {
+
+    for (int i = 0; i < num_tokens; i++)
+        if (tokens[i].user_id == user_id && (time_t)tokens[i].expire_time > time(NULL))
+            return tokens[i].token;
+
+    num_tokens++;
+    tokens = (num_tokens - 1) ? ec_realloc(tokens, sizeof(AuthToken) * num_tokens) : ec_malloc(sizeof(AuthToken));
+
+    tokens[num_tokens - 1].user_id     = user_id;
+    tokens[num_tokens - 1].expire_time = time(NULL) + 36 * 60 * 60; // 36 hours
+    randombytes_buf(tokens[num_tokens - 1].token, TOKEN_LEN);
+
+    tokens_modified = 1;
+
+    return tokens[num_tokens - 1].token;
+}
+
+int check_token(uint32_t user_id, char *token_b64) {
+
+    if (user_id <= 0)
+        return -1;
+
+    int      token_len;
+    uint8_t *token = b64_decode(token_b64, &token_len);
+    if (!token || token_len != TOKEN_LEN)
+        return -2;
+
+    int error = 0;
+
+    pthread_mutex_lock(&tokens_lock);
+
+    for (int i = 0; i < num_tokens; i++) {
+        if (tokens[i].user_id == user_id && !memcmp(token, tokens[i].token, TOKEN_LEN)) {
+            if ((time_t)tokens[i].expire_time > time(NULL)) {
+                error = 0;
+                goto found_valid_token;
+            } else
+                error = E_EXPIREDTOKEN; // don't break, just in case there is an unexpired token
+        }
+    }
+
+    if (!error)
+        error = E_INVALIDTOKEN;
+
+found_valid_token:
+
+    pthread_mutex_unlock(&tokens_lock);
+
+    return error;
+}
+
+void clean_tokens() {
+
+    pthread_mutex_lock(&tokens_lock);
+
+    for (int i = 0; i < num_tokens; i++) {
+        if ((time_t)tokens[i].expire_time < time(NULL)) {
+            num_tokens--;
+            if (num_tokens == 0) {
+                free(tokens);
+                tokens = NULL;
+            } else {
+                for (int j = i; j < num_tokens; j++)
+                    tokens[j] = tokens[j + 1];
+                tokens = ec_realloc(tokens, num_tokens * sizeof(AuthToken));
+                i--;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&tokens_lock);
 }
 
 int save_tokens() {
@@ -626,6 +710,59 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
         return response;
     }
 
+    pthread_mutex_lock(&accounts_lock);
+    for (int i = 0; i < num_accounts; i++) {
+        if (!strcmp(accounts[i].email, email)) {
+
+            pthread_mutex_unlock(&accounts_lock);
+
+            free(username_hash);
+            free(password_hash);
+            free(auth_pk);
+
+            cJSON *response = cJSON_CreateObject();
+            cJSON_AddNumberToObject(response, "code", E_DUPEVAL);
+            cJSON_AddStringToObject(response, "err", "Provided email already exists in accounts database!");
+            return response;
+        }
+    }
+
+    pthread_mutex_unlock(&accounts_lock);
+
+    wchar_t wemail[320];
+    size_t  converted = mbstowcs(wemail, email, sizeof(wemail) / sizeof(wchar_t));
+
+    if (converted == (size_t)-1 || converted >= 320) {
+
+        free(username_hash);
+        free(password_hash);
+        free(auth_pk);
+
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddNumberToObject(response, "code", E_INTERNALERR);
+        cJSON_AddStringToObject(response, "err", "Failed to convert email to wchar to validate!");
+        return response;
+    }
+
+    valid_mail_t email_vld = validate_email(wemail);
+    if (!email_vld.success) {
+
+        free(username_hash);
+        free(password_hash);
+        free(auth_pk);
+
+        char lib_vld_msg[256];
+        wcstombs(lib_vld_msg, email_vld.message, sizeof(lib_vld_msg));
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Invalid email address: %s", lib_vld_msg);
+        msg[strlen(msg) - 1] = 0; // remove '\n'
+
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddNumberToObject(response, "code", E_INVALIDEMAIL);
+        cJSON_AddStringToObject(response, "err", msg);
+        return response;
+    }
+
     if (smtp_enabled()) {
 
     resend_email:
@@ -636,16 +773,16 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
             // dump expired codes; note that if another thread runs this code, it
             // will force the client to call the full CREATEACCOUNT request again
             // if a resend was requested, instead of just setting the resend flag.
-            if (verification_codes[i].expire_time < time(NULL)) {
-                if ((!username_hash || !password_hash || !auth_pk) && !strcmp(email, verification_codes[i].email)) {
+            if ((time_t)verification_codes[i].expire_time < time(NULL)) {
+                if ((!username_hash || !password_hash || !auth_pk) &&
+                    !strcmp(email, verification_codes[i].new_acc->email)) {
                     verification_codes[i].code        = gen_verification_code();
                     verification_codes[i].expire_time = time(NULL) + (60 * 60);
 
                     code = i;
                 } else {
-                    free(verification_codes[i].email);
-                    if (verification_codes[i].new_acc)
-                        free(verification_codes[i].new_acc);
+                    free(verification_codes[i].new_acc->email);
+                    free(verification_codes[i].new_acc);
                     num_outstanding_codes--;
                     for (int j = i; j < num_outstanding_codes; j++)
                         verification_codes[j] = verification_codes[j + 1];
@@ -659,7 +796,7 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
                 }
                 continue;
             }
-            if (!strcmp(verification_codes[i].email, email))
+            if (!strcmp(verification_codes[i].new_acc->email, email))
                 code = i;
         }
 
@@ -690,6 +827,8 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
             memcpy(verification_codes[code_idx].new_acc->uname_hash, username_hash, UNAME_HASH_LEN);
             memcpy(verification_codes[code_idx].new_acc->passwd_hash, password_hash, PASSWD_HASH_LEN);
             memcpy(verification_codes[code_idx].new_acc->auth_pk, auth_pk, AUTH_PK_LEN);
+            verification_codes[code_idx].new_acc->email_len = strlen(email);
+            verification_codes[code_idx].new_acc->email     = strdup(email);
 
             free(username_hash);
             free(password_hash);
@@ -697,18 +836,14 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
 
             code = gen_verification_code();
 
-            verification_codes[code_idx].code  = code;
-            verification_codes[code_idx].email = strdup(email);
-
-            time_t expire_time = time(NULL) + 60 * 60; // 1 hour
-
-            verification_codes[code_idx].expire_time = expire_time;
+            verification_codes[code_idx].code        = code;
+            verification_codes[code_idx].expire_time = time(NULL) + 60 * 60; // 1 hour;
         }
 
         if (send_verification_email(email, code) < 0) {
             if (code_idx >= 0) {
+                free(verification_codes[code_idx].new_acc->email);
                 free(verification_codes[code_idx].new_acc);
-                free(verification_codes[code_idx].email);
                 if (num_outstanding_codes == 1) {
                     free(verification_codes);
                     verification_codes = NULL;
@@ -735,26 +870,14 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
         cJSON_AddNumberToObject(response, "code", DATA_WAIT);
         return response;
     } else {
-        pthread_mutex_lock(&accounts_lock);
-        for (int i = 0; i < num_accounts; i++) {
-            if (!strcmp(user_emails[i].email, email)) {
-
-                pthread_mutex_unlock(&accounts_lock);
-
-                cJSON *response = cJSON_CreateObject();
-                cJSON_AddNumberToObject(response, "code", E_DUPEVAL);
-                cJSON_AddStringToObject(response, "err", "Provided email already exists in accounts database!");
-                return response;
-            }
-        }
-
-        pthread_mutex_unlock(&accounts_lock);
 
         ServerAccount *new_acc = ec_malloc(sizeof(ServerAccount));
         new_acc->user_id       = 0; // tbd
         memcpy(new_acc->uname_hash, username_hash, UNAME_HASH_LEN);
         memcpy(new_acc->passwd_hash, password_hash, PASSWD_HASH_LEN);
         memcpy(new_acc->auth_pk, auth_pk, AUTH_PK_LEN);
+        new_acc->email_len = strlen(email);
+        new_acc->email     = strdup(email);
 
         free(username_hash);
         free(password_hash);
@@ -766,18 +889,115 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
 
 cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc) {
 
-    if (code >= 0) { // verify code
-        //
+    // new_acc only set if no code is required (-1), email is required either way
+    if ((code >= 0 && new_acc) || !email) {
+
+        if (new_acc) {
+            free(new_acc->email);
+            free(new_acc);
+        }
+
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddNumberToObject(response, "code", E_INTERNALERR);
+        cJSON_AddStringToObject(response, "err",
+                                "Invalid data passed to finish_create_account! (expected either code OR new_acc "
+                                "struct, as well as valid email pointer)");
+        return response;
     }
 
-    // add account
+    if (code >= 0) { // verify code
 
+        pthread_mutex_lock(&verification_codes_lock);
+
+        for (int i = 0; i < num_outstanding_codes; i++) {
+            if (!strcmp(email, verification_codes[i].new_acc->email)) {
+                if (code != verification_codes[i].code) {
+                    pthread_mutex_unlock(&verification_codes_lock);
+
+                    cJSON *response = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(response, "code", E_INVALIDCODE);
+                    cJSON_AddStringToObject(response, "err", "Incorrect verification code for provided email");
+                    return response;
+                } else if ((time_t)verification_codes[i].expire_time < time(NULL)) {
+                    pthread_mutex_unlock(&verification_codes_lock);
+
+                    cJSON *response = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(response, "code", E_EXPIREDCODE);
+                    cJSON_AddStringToObject(response, "err",
+                                            "Verification code expired; try CREATEACCOUNT <email> request_resend=true");
+                    return response;
+                }
+
+                new_acc = verification_codes[i].new_acc; // now owned by this function
+
+                num_outstanding_codes--;
+                for (int j = i; j < num_outstanding_codes; j++)
+                    verification_codes[j] = verification_codes[j + 1];
+                if (num_outstanding_codes == 0) {
+                    free(verification_codes);
+                    verification_codes = NULL;
+                } else
+                    verification_codes =
+                        ec_realloc(verification_codes, num_outstanding_codes * sizeof(EmailVerificationCode));
+            }
+        }
+
+        pthread_mutex_unlock(&verification_codes_lock);
+
+        if (!new_acc) {
+            cJSON *response = cJSON_CreateObject();
+            cJSON_AddNumberToObject(response, "code", E_INVALIDDATA);
+            cJSON_AddStringToObject(response, "err",
+                                    "Invalid email address (no associated outstanding verification code)");
+            return response;
+        }
+    }
+
+    new_acc->user_id = get_next_user_id();
+
+    pthread_mutex_lock(&accounts_lock);
+
+    num_accounts++;
+    accounts = (num_accounts - 1) ? ec_realloc(accounts, sizeof(ServerAccount) * num_accounts)
+                                  : ec_malloc(sizeof(ServerAccount));
+
+    // transfers ownership of char *email to accounts array
+    accounts[num_accounts - 1] = *new_acc;
+
+    accounts_modified = 1;
+
+    pthread_mutex_unlock(&accounts_lock);
+
+    pthread_mutex_lock(&tokens_lock);
+    uint8_t *token = assign_token(new_acc->user_id);
+    pthread_mutex_unlock(&tokens_lock);
+
+    free(new_acc);
+
+    char *token_b64 = b64_encode(token, TOKEN_LEN);
+    if (!token_b64) {
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddNumberToObject(response, "code", E_INTERNALERR);
+        cJSON_AddStringToObject(response, "err",
+                                "Failed to encode token as base64! Your account has been successfully created and a "
+                                "token was assigned, but it could not be returned.");
+        return response;
+    }
+
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+    cJSON_AddStringToObject(response, "token", token_b64);
+    free(token_b64);
+    return response;
+}
+
+cJSON *run_update_account(cJSON *request) {
     cJSON *response = cJSON_CreateObject();
     cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
     return response;
 }
 
-cJSON *run_update_account(cJSON *request) {
+cJSON *run_auth(cJSON *request) {
     cJSON *response = cJSON_CreateObject();
     cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
     return response;
@@ -1061,20 +1281,25 @@ int save_server_data() {
     int err = 0;
     if (save_accounts())
         err |= 1;
+    clean_tokens();
     if (save_tokens())
         err |= 2;
     // not saving verification codes since they expire after an hour anyway
     return err;
 }
 
+#ifndef SAVE_INTERVAL_MINUTES
+#define SAVE_INTERVAL_MINUTES 5
+#endif
+
 void *save_thread(void *arg) {
     (void)arg;
     while (1) {
-        sleep(5 * 60);
+        sleep(SAVE_INTERVAL_MINUTES * 60);
         int err = save_server_data();
         if (err)
-            plog(PLOG_WARN, "Failed to save data persistently! (accounts save %s) (tokens save %s)",
-                 (err & 1) ? "failed" : "ok", (err & (1 << 1)) ? "failed" : "ok");
+            plog(PLOG_WARN, "Failed to save data to persistent storage! (accounts save %s) (tokens save %s)",
+                 (err & 1) ? "failed" : "ok", (err & 2) ? "failed" : "ok");
         else
             L_DEBUG("Successfully saved data to persistent storage");
     }
@@ -1161,7 +1386,7 @@ int main() {
         free(hash);
 
         num_accounts = hdr->num_accounts;
-        accounts     = ec_malloc(sizeof(ServerAccount) * num_accounts);
+        accounts     = ec_calloc(num_accounts, sizeof(ServerAccount));
         int i        = 0;
 
         for (uint8_t *p = accounts_buf + sizeof(ServerAccountHeader);
@@ -1170,30 +1395,28 @@ int main() {
             memcpy(&accounts[i++], p, sizeof(ServerAccount));
 
         uint8_t *email_start = accounts_buf + sizeof(ServerAccountHeader) + (sizeof(ServerAccount) * num_accounts);
-        user_emails          = ec_calloc(num_accounts, sizeof(UserEmail));
-        int bytes_read       = 0;
-        int remaining_size   = fsize - (sizeof(ServerAccountHeader) + (sizeof(ServerAccount) * num_accounts));
+
+        int bytes_read     = 0;
+        int remaining_size = fsize - (sizeof(ServerAccountHeader) + (sizeof(ServerAccount) * num_accounts));
 
         for (int j = 0; j < num_accounts; j++) {
-            if (remaining_size - bytes_read < (int64_t)sizeof(UserEmail) - (int64_t)sizeof(char *)) {
-                L_FATAL("Invalid email structure in accounts_buf! (not enough space for struct UserEmail)");
-                free_emails();
-                free(accounts);
+            if (remaining_size - bytes_read < (int64_t)sizeof(uint16_t)) {
+                L_FATAL("Invalid email structure in accounts_buf! (not enough space for email_len)");
+                free_accounts();
                 return 2;
             }
-            memcpy(user_emails + j, email_start + bytes_read, sizeof(UserEmail) - sizeof(char *));
-            bytes_read += sizeof(UserEmail) - sizeof(char *);
+            memcpy(&accounts->email_len, email_start + bytes_read, sizeof(uint16_t));
+            bytes_read += sizeof(uint16_t);
 
-            if (remaining_size - bytes_read < user_emails[j].email_len) {
+            if (remaining_size - bytes_read < accounts[j].email_len) {
                 L_FATAL("Invalid email structure in accounts_buf! (not enough space for struct UserEmail)");
-                free_emails();
-                free(accounts);
+                free_accounts();
                 return 2;
             }
-            user_emails[j].email = ec_malloc(user_emails[j].email_len + 1);
-            memcpy(user_emails[j].email, email_start + bytes_read, user_emails[j].email_len);
-            user_emails[j].email[user_emails[j].email_len] = 0;
-            bytes_read += user_emails[j].email_len;
+            accounts[j].email = ec_malloc(accounts[j].email_len + 1);
+            memcpy(accounts[j].email, email_start + bytes_read, accounts[j].email_len);
+            accounts[j].email[accounts[j].email_len] = 0;
+            bytes_read += accounts[j].email_len;
         }
 
         free(accounts_buf);
@@ -1210,8 +1433,7 @@ int main() {
         if (!tokens_fp) {
             L_FATAL("Failed to create tokens file!");
             if (accounts) {
-                free(accounts);
-                free_emails();
+                free_accounts();
             }
             return 3;
         }
@@ -1222,10 +1444,7 @@ int main() {
         uint8_t *hash = sha_256_hash((uint8_t *)hdr + 10 + HASH_LEN, sizeof(TokenFileHeader) - 10 - HASH_LEN);
         if (!hash) {
             L_FATAL("Failed to hash new token file header!");
-            if (accounts) {
-                free(accounts);
-                free_emails();
-            }
+            free_accounts();
             fclose(tokens_fp);
             free(hdr);
             return 3;
@@ -1243,10 +1462,7 @@ int main() {
         if (fsize < (int64_t)sizeof(TokenFileHeader)) {
             L_ERROR("tokens.bin is too small to contain a valid header!");
             fclose(tokens_fp);
-            if (accounts) {
-                free(accounts);
-                free_emails();
-            }
+            free_accounts();
             return 3;
         }
 
@@ -1259,19 +1475,13 @@ int main() {
         if (memcmp(hdr->magic, TOKEN_FILE_MAGIC, 6)) { // invalid magic
             L_FATAL("Invalid file format! (wrong magic bytes)");
             free(tokens_buf);
-            if (accounts) {
-                free(accounts);
-                free_emails();
-            }
+            free_accounts();
             return 3;
         }
         if (hdr->version != TOKEN_FILE_VERSION) {
             L_FATAL("Invalid file format! (wrong version)");
             free(tokens_buf);
-            if (accounts) {
-                free(accounts);
-                free_emails();
-            }
+            free_accounts();
             return 3;
         }
 
@@ -1279,10 +1489,7 @@ int main() {
         if (!hash) {
             L_FATAL("Failed to hash tokens data!");
             free(tokens_buf);
-            if (accounts) {
-                free(accounts);
-                free_emails();
-            }
+            free_accounts();
             return 3;
         }
 
@@ -1290,10 +1497,7 @@ int main() {
             L_FATAL("Could not verify tokens.bin integrity; hashes do not match!");
             free(hash);
             free(tokens_buf);
-            if (accounts) {
-                free(accounts);
-                free_emails();
-            }
+            free_accounts();
             return 3;
         }
 
@@ -1304,8 +1508,8 @@ int main() {
         int i      = 0;
 
         for (uint8_t *p = tokens_buf + sizeof(TokenFileHeader);
-             p < tokens_buf + sizeof(TokenFileHeader) + num_tokens * sizeof(ServerAccount); p += sizeof(ServerAccount))
-            memcpy(&tokens[i++], p, sizeof(ServerAccount));
+             p < tokens_buf + sizeof(TokenFileHeader) + num_tokens * sizeof(AuthToken); p += sizeof(AuthToken))
+            memcpy(&tokens[i++], p, sizeof(AuthToken));
 
         free(tokens_buf);
     }
@@ -1322,10 +1526,7 @@ int main() {
     ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) {
         openssl_log_errors();
-        if (accounts) {
-            free(accounts);
-            free_emails();
-        }
+        free_accounts();
         if (tokens)
             free(tokens);
         return 5;
@@ -1335,10 +1536,7 @@ int main() {
         SSL_CTX_use_PrivateKey_file(ctx, SERVER_KEY, SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_load_verify_locations(ctx, CA_CRT, NULL) <= 0) {
         openssl_log_errors();
-        if (accounts) {
-            free(accounts);
-            free_emails();
-        }
+        free_accounts();
         if (tokens)
             free(tokens);
         return 6;
@@ -1361,10 +1559,7 @@ int main() {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         L_FATAL("Failed to create socket\n");
-        if (accounts) {
-            free(accounts);
-            free_emails();
-        }
+        free_accounts();
         if (tokens)
             free(tokens);
         return 7;
@@ -1380,10 +1575,7 @@ int main() {
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         L_FATAL("Failed to bind socket\n");
-        if (accounts) {
-            free(accounts);
-            free_emails();
-        }
+        free_accounts();
         if (tokens)
             free(tokens);
         return 8;
@@ -1391,10 +1583,7 @@ int main() {
 
     if (listen(server_fd, 10) < 0) {
         L_FATAL("listen() call failed for server_fd\n");
-        if (accounts) {
-            free(accounts);
-            free_emails();
-        }
+        free_accounts();
         if (tokens)
             free(tokens);
         return 9;
@@ -1428,9 +1617,13 @@ int main() {
         pthread_mutex_unlock(&q_mutex);
     }
 
+    int err = save_server_data();
+    if (err)
+        plog(PLOG_WARN, "Failed to save data to persistent storage! (accounts save %s) (tokens save %s)",
+             (err & 1) ? "failed" : "ok", (err & 2) ? "failed" : "ok");
+
     close(server_fd);
-    free(accounts);
-    free_emails();
+    free_accounts();
     free(tokens);
     return 0;
 }
