@@ -1,3 +1,6 @@
+// suppress ide warnings about sigaction
+#define _POSIX_C_SOURCE 200809L
+
 #include "server.h"
 #include "cJSON.h"
 #include "vldmail.h"
@@ -6,6 +9,7 @@
 #include <fcntl.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <signal.h>
 #include <sodium.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -30,49 +34,45 @@
 #define SERVER_INFO "Password Manager Server - version 1.0"
 #endif
 
+#ifndef MAX
 #define MAX(a, b) (a > b ? a : b)
+#endif
+
+#ifndef MIN
+#define MIN(a, b) (a < b ? a : b)
+#endif
 
 enum LogLevel { PLOG_DEBUG, PLOG_INFO, PLOG_WARN, PLOG_ERROR, PLOG_FATAL };
 typedef enum LogLevel LogLevel;
 
 static void plog(LogLevel level, const char *fmt, ...);
 
-void util_assert(int cond, char *fail_msg) {
+static void util_assert(int cond, char *fail_msg) {
     if (!cond) {
         plog(PLOG_FATAL, "Assertion failed: %s", fail_msg);
         exit(2);
     }
 }
 
-void wipe_mem(void *mem, size_t bytes) {
-    memset(mem, 0, bytes);
-
-#if defined(_MSC_VER)
-    _ReadWriteBarrier();
-#else
-    __asm__ __volatile__("" : : "r"(mem) : "memory");
-#endif
-}
-
-void *ec_malloc(size_t size) {
+static void *ec_malloc(size_t size) {
     void *ptr = malloc(size);
     util_assert(ptr != NULL, "malloc returned NULL pointer");
     return ptr;
 }
 
-void *ec_calloc(size_t nmeb, size_t size) {
+static void *ec_calloc(size_t nmeb, size_t size) {
     void *ptr = calloc(nmeb, size);
     util_assert(ptr != NULL, "calloc returned NULL pointer");
     return ptr;
 }
 
-void *ec_realloc(void *ptr, size_t size) {
+static void *ec_realloc(void *ptr, size_t size) {
     void *new_ptr = realloc(ptr, size);
     util_assert(new_ptr != NULL, "realloc returned NULL pointer");
     return new_ptr;
 }
 
-char *b64_encode(const uint8_t *input, int input_len) {
+static char *b64_encode(const uint8_t *input, int input_len) {
     if (!input || input_len <= 0)
         return NULL;
 
@@ -85,7 +85,7 @@ char *b64_encode(const uint8_t *input, int input_len) {
     return out;
 }
 
-uint8_t *b64_decode(const char *input, int *out_len) {
+static uint8_t *b64_decode(const char *input, int *out_len) {
     if (!input)
         return NULL;
 
@@ -174,7 +174,7 @@ static void plog(LogLevel level, const char *fmt, ...) {
 #define L_ERROR(msg) plog(PLOG_ERROR, msg)
 #define L_FATAL(msg) plog(PLOG_FATAL, msg)
 
-void openssl_log_errors() {
+static void openssl_log_errors() {
     unsigned long err;
     while ((err = ERR_get_error()) != 0) {
         const char *msg = ERR_error_string(err, NULL);
@@ -182,7 +182,7 @@ void openssl_log_errors() {
     }
 }
 
-uint8_t *sha_256_hash(uint8_t *data, size_t len) {
+static uint8_t *sha_256_hash(uint8_t *data, size_t len) {
     uint8_t *hash_buf = ec_malloc(32);
     uint32_t out_len;
 
@@ -202,6 +202,27 @@ uint8_t *sha_256_hash(uint8_t *data, size_t len) {
     return hash_buf;
 }
 
+static char *hash_email(const char *email) {
+    uint8_t *hash_bin = sha_256_hash((uint8_t *)email, strlen(email));
+
+    char *email_hash = ec_malloc(65);
+    if (!email_hash)
+        return NULL;
+    for (int i = 0; i < 32; i++)
+        sprintf(&email_hash[i * 2], "%02x", hash_bin[i]);
+
+    email_hash[64] = '\0';
+    return email_hash;
+}
+
+static cJSON *server_error(int code, char *message) {
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", code);
+    if (message)
+        cJSON_AddStringToObject(response, "err", message);
+    return response;
+}
+
 #define SERVER_ACCOUNT_FILE_MAGIC "PMSACC"
 #define SERVER_ACCOUNT_FILE_VERSION 1
 
@@ -209,11 +230,21 @@ uint8_t *sha_256_hash(uint8_t *data, size_t len) {
 #define TOKEN_FILE_VERSION 1
 
 #define HASH_LEN 32
-#define SALT_LEN 16
+#define SALT_LEN crypto_pwhash_SALTBYTES
 #define UNAME_HASH_LEN HASH_LEN
 #define PASSWD_HASH_LEN HASH_LEN + SALT_LEN
-#define AUTH_PK_LEN 32
-#define TOKEN_LEN 32
+#define AUTH_PK_LEN crypto_sign_PUBLICKEYBYTES
+#define TOKEN_LEN HASH_LEN
+#define CHALLENGE_LEN HASH_LEN
+#define SIGNATURE_LEN crypto_sign_BYTES
+
+typedef enum ExpectedData {
+    D_NONE,
+    D_CA_EMAIL_VERIFICATION_CODE,
+    D_UA_EMAIL_VERIFICATION_CODE,
+    D_CHALLENGE_RESPONSE,
+    D_PWMNGR_FILE_TRANSFER,
+} ExpectedData;
 
 typedef struct __attribute__((packed)) ServerAccountHeader {
     char     magic[6];
@@ -227,6 +258,8 @@ typedef struct __attribute__((packed)) ServerAccount {
     uint8_t  uname_hash[UNAME_HASH_LEN];
     uint8_t  passwd_hash[PASSWD_HASH_LEN];
     uint8_t  auth_pk[AUTH_PK_LEN];
+    uint8_t  salt[SALT_LEN]; // stored here for syncing accounts
+    uint64_t auth_seed_id;
     uint16_t email_len;
     char    *email;
 } ServerAccount;
@@ -244,6 +277,22 @@ typedef struct __attribute__((packed)) AuthToken {
     uint32_t user_id;
 } AuthToken;
 
+#define NONCE_LEN 12
+#define TAG_LEN 16
+
+// copied from client-side; only magic, version, hash, and timestamp are really used
+typedef struct __attribute__((packed)) VaultHeader {
+    char     magic[6];
+    uint32_t version;
+    uint8_t  hash[HASH_LEN];
+    uint64_t timestamp;
+    uint32_t num_entries;
+    uint32_t ciphertext_len;
+    uint8_t  salt[SALT_LEN];
+    uint8_t  nonce[NONCE_LEN];
+    uint8_t  tag[TAG_LEN];
+} VaultHeader;
+
 typedef struct SmtpConfig {
     int   use_smtp_verification;
     char *smtp_host;
@@ -258,6 +307,8 @@ typedef struct EmailVerificationCode {
     int            code;
     time_t         expire_time;
     ServerAccount *new_acc;
+    char          *request_ip_src;
+    ExpectedData   type;
 
 } EmailVerificationCode;
 
@@ -270,7 +321,7 @@ pthread_mutex_t        verification_codes_lock = PTHREAD_MUTEX_INITIALIZER;
 ServerAccount *accounts          = NULL;
 int            num_accounts      = 0;
 int            accounts_modified = 0;
-// UserEmail     *user_emails       = NULL;
+
 AuthToken *tokens          = NULL;
 int        num_tokens      = 0;
 int        tokens_modified = 0;
@@ -278,24 +329,80 @@ int        tokens_modified = 0;
 pthread_mutex_t accounts_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t tokens_lock   = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct FileLockEntry {
+    char                 *key;
+    pthread_mutex_t       lock;
+    struct FileLockEntry *next;
+} FileLockEntry;
+
+#define NUM_BUCKETS 256
+static FileLockEntry  *file_lock_table[NUM_BUCKETS];
+static pthread_mutex_t file_lock_table_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t djb2_hash(const char *file_key) {
+    uint64_t h = 5381;
+    int      c;
+    while ((c = *file_key++))
+        h = ((h << 5) + h) + c;
+    return h % NUM_BUCKETS;
+}
+
+static pthread_mutex_t *get_file_lock(const char *file_key) {
+    unsigned long h = djb2_hash(file_key);
+
+    pthread_mutex_lock(&file_lock_table_lock);
+
+    FileLockEntry *e = file_lock_table[h];
+    while (e) {
+        if (strcmp(e->key, file_key) == 0) {
+            pthread_mutex_unlock(&file_lock_table_lock);
+            return &e->lock;
+        }
+        e = e->next;
+    }
+
+    e      = ec_malloc(sizeof(FileLockEntry));
+    e->key = strdup(file_key);
+    pthread_mutex_init(&e->lock, NULL);
+    e->next            = file_lock_table[h];
+    file_lock_table[h] = e;
+
+    pthread_mutex_unlock(&file_lock_table_lock);
+
+    return &e->lock;
+}
+
+static void lock_file(const char *path) {
+    pthread_mutex_t *lock = get_file_lock(path);
+    pthread_mutex_lock(lock);
+}
+
+static void unlock_file(const char *path) {
+    pthread_mutex_t *lock = get_file_lock(path);
+    pthread_mutex_unlock(lock);
+}
+
 static inline int smtp_enabled() {
     return smtp_config && smtp_config->use_smtp_verification && smtp_config->smtp_host &&
            smtp_config->smtp_from; // && smtp_config->smtp_user && smtp_config->smtp_pass
 }
 
-inline int gen_verification_code() {
+static inline int gen_verification_code() {
     return randombytes_uniform(1000000);
 }
 
-int load_smtp_config() {
+static int load_smtp_config() {
     if (smtp_config) {
         L_ERROR("smtp config already loaded!");
         return -1;
     }
 
+    lock_file(SMTP_CONF_FILE);
     FILE *fp = fopen(SMTP_CONF_FILE, "r");
-    if (!fp)
+    if (!fp) {
+        unlock_file(SMTP_CONF_FILE);
         return -2;
+    }
 
     smtp_config = ec_calloc(1, sizeof(SmtpConfig));
 
@@ -333,10 +440,11 @@ int load_smtp_config() {
     }
 
     fclose(fp);
+    unlock_file(SMTP_CONF_FILE);
     return 0;
 }
 
-void free_accounts() {
+static void free_accounts() {
     pthread_mutex_lock(&accounts_lock);
     if (!accounts)
         return;
@@ -347,7 +455,7 @@ void free_accounts() {
     pthread_mutex_unlock(&accounts_lock);
 }
 
-int save_accounts() {
+static int save_accounts() {
 
     if (!accounts_modified)
         return 0; // nothing to do
@@ -388,8 +496,6 @@ int save_accounts() {
         written_email_len += accounts[i].email_len;
     }
 
-    pthread_mutex_unlock(&accounts_lock);
-
     write_len += written_email_len;
 
     uint8_t *hash = sha_256_hash(write_buf + 10 + HASH_LEN, write_len - 10 - HASH_LEN);
@@ -399,8 +505,12 @@ int save_accounts() {
     } else
         L_WARN("Failed to hash accounts data! Writing anyway with invalid hash");
 
+    lock_file(ACCOUNTS_FILE); // not strictly necessary but good for future-proofing
+
     FILE *fp = fopen(ACCOUNTS_FILE, "wb");
     if (!fp) {
+        pthread_mutex_unlock(&accounts_lock);
+        unlock_file(ACCOUNTS_FILE);
         L_ERROR("Failed to open accounts file to save data!");
         free(write_buf);
         return -1;
@@ -410,14 +520,19 @@ int save_accounts() {
     plog(PLOG_DEBUG, "Wrote %d bytes to accounts.bin", write_len);
     fclose(fp);
 
+    unlock_file(ACCOUNTS_FILE);
+
     free(write_buf);
 
     accounts_modified = 0;
 
+    // don't unlock until here because we need to set accounts_modified still
+    pthread_mutex_unlock(&accounts_lock);
+
     return 0; // success
 }
 
-uint32_t get_next_user_id() {
+static uint32_t get_next_user_id() {
     uint32_t id = 0;
 
     pthread_mutex_lock(&accounts_lock);
@@ -428,12 +543,25 @@ uint32_t get_next_user_id() {
     return ++id;
 }
 
-// returns pointer to the token in the tokens array; caller is responsible for locks
-uint8_t *assign_token(uint32_t user_id) {
+static uint32_t get_uid(char *email) {
+    pthread_mutex_lock(&accounts_lock);
+    for (int i = 0; i < num_accounts; i++) {
+        if (!strcmp(accounts[i].email, email)) {
+            uint32_t uid = accounts[i].user_id;
+            pthread_mutex_unlock(&accounts_lock);
+            return uid;
+        }
+    }
+    pthread_mutex_unlock(&accounts_lock);
 
-    for (int i = 0; i < num_tokens; i++)
-        if (tokens[i].user_id == user_id && (time_t)tokens[i].expire_time > time(NULL))
-            return tokens[i].token;
+    return 0;
+}
+
+// TODO: possible ddos point (one client can AUTH many times and cause OOM)
+// adds new token and returns base64-encoded version
+static char *assign_token(uint32_t user_id) {
+
+    pthread_mutex_lock(&tokens_lock);
 
     num_tokens++;
     tokens = (num_tokens - 1) ? ec_realloc(tokens, sizeof(AuthToken) * num_tokens) : ec_malloc(sizeof(AuthToken));
@@ -444,18 +572,23 @@ uint8_t *assign_token(uint32_t user_id) {
 
     tokens_modified = 1;
 
-    return tokens[num_tokens - 1].token;
+    char *token_b64 = b64_encode(tokens[num_tokens - 1].token, TOKEN_LEN);
+
+    pthread_mutex_unlock(&tokens_lock);
+
+    return token_b64;
 }
 
-int check_token(uint32_t user_id, char *token_b64) {
+// returns reponse with err set on error, NULL on success
+static cJSON *check_raw_token(char *email, uint8_t *token) {
+
+    if (!email || !token)
+        return server_error(E_INTERNALERR, "Missing email/token");
+
+    uint32_t user_id = get_uid(email);
 
     if (user_id <= 0)
-        return -1;
-
-    int      token_len;
-    uint8_t *token = b64_decode(token_b64, &token_len);
-    if (!token || token_len != TOKEN_LEN)
-        return -2;
+        return server_error(E_NOACCOUNT, "Failed to check token: invalid email");
 
     int error = 0;
 
@@ -466,27 +599,59 @@ int check_token(uint32_t user_id, char *token_b64) {
             if ((time_t)tokens[i].expire_time > time(NULL)) {
                 error = 0;
                 goto found_valid_token;
-            } else
-                error = E_EXPIREDTOKEN; // don't break, just in case there is an unexpired token
+            } else {
+                // collision chance is negligible in randomized 256-bit space; just return error
+                error = E_EXPIREDTOKEN;
+                break;
+            }
         }
     }
 
-    if (!error)
-        error = E_INVALIDTOKEN;
+    if (!error) {
+        pthread_mutex_unlock(&tokens_lock);
+        free(token);
+        return server_error(E_INVALIDTOKEN, "Token incorrect/not found for provided id");
+    }
 
 found_valid_token:
 
     pthread_mutex_unlock(&tokens_lock);
 
-    return error;
+    free(token);
+
+    if (error)
+        return server_error(error, "Token expired");
+    return NULL;
 }
 
-void clean_tokens() {
+static cJSON *check_token(cJSON *request) {
+
+    cJSON *email_obj = cJSON_GetObjectItem(request, "email");
+    cJSON *token_obj = cJSON_GetObjectItem(request, "token");
+
+    if (!email_obj || !cJSON_IsString(email_obj))
+        return server_error(E_BADREQ, "Missing email!");
+
+    if (!token_obj || !cJSON_IsString(token_obj))
+        return server_error(E_BADREQ, "Missing token!");
+
+    int      token_len;
+    uint8_t *token = b64_decode(cJSON_GetStringValue(token_obj), &token_len);
+    if (!token || token_len != TOKEN_LEN)
+        return server_error(E_BADTOKEN, "Failed to decode base64 token");
+
+    cJSON *ret = check_raw_token(cJSON_GetStringValue(email_obj), token);
+    free(token);
+    return ret;
+}
+
+static void clean_tokens() {
 
     pthread_mutex_lock(&tokens_lock);
 
     for (int i = 0; i < num_tokens; i++) {
         if ((time_t)tokens[i].expire_time < time(NULL)) {
+            tokens_modified = 1;
             num_tokens--;
             if (num_tokens == 0) {
                 free(tokens);
@@ -503,7 +668,7 @@ void clean_tokens() {
     pthread_mutex_unlock(&tokens_lock);
 }
 
-int save_tokens() {
+static int save_tokens() {
 
     if (!tokens_modified)
         return 0; // nothing to do
@@ -528,8 +693,6 @@ int save_tokens() {
 
     write_len += sizeof(AuthToken) * num_tokens;
 
-    pthread_mutex_unlock(&tokens_lock);
-
     uint8_t *hash = sha_256_hash(write_buf + 10 + HASH_LEN, write_len - 10 - HASH_LEN);
     if (hash) {
         memcpy(hdr->hash, hash, HASH_LEN);
@@ -537,8 +700,12 @@ int save_tokens() {
     } else
         L_WARN("Failed to hash tokens data! Writing anyway with invalid hash");
 
+    lock_file(TOKENS_FILE);
+
     FILE *fp = fopen(TOKENS_FILE, "wb");
     if (!fp) {
+        pthread_mutex_unlock(&tokens_lock);
+        unlock_file(TOKENS_FILE);
         L_ERROR("Failed to open tokens file to save data!");
         free(write_buf);
         return -1;
@@ -548,9 +715,13 @@ int save_tokens() {
     plog(PLOG_DEBUG, "Wrote %d bytes to tokens.bin", write_len);
     fclose(fp);
 
+    unlock_file(TOKENS_FILE);
+
     free(write_buf);
 
     tokens_modified = 0;
+
+    pthread_mutex_unlock(&tokens_lock);
 
     return 0; // success
 }
@@ -577,7 +748,7 @@ static size_t libcurl_read_cb(char *buffer, size_t size, size_t nmemb, void *use
     return to_copy;
 }
 
-int send_verification_email(const char *to, int code) {
+static int send_verification_email(const char *to, int code) {
     CURL *curl = curl_easy_init();
     if (!curl)
         return -1;
@@ -600,7 +771,9 @@ int send_verification_email(const char *to, int code) {
              "Subject: Your Password Manager verification code\r\n"
              "\r\n"
              "Your account creation code is %06d\r\n"
-             "This code is sent to verify that you own the email address you entered when creating your account.\r\n"
+             "This code is sent to verify that you own the email address you entered when creating/updating your "
+             "account.\r\n"
+             "Do not share it with anyone, and only enter it in a trusted Password Manager client.\r\n"
              "If you did not request this code, you should take action to secure your account now.",
              code);
 
@@ -628,30 +801,39 @@ int send_verification_email(const char *to, int code) {
     return (res == CURLE_OK) ? 0 : -1;
 }
 
-typedef enum ExpectedData { D_NONE, D_CREATEACC_VERIFICATION_CODE, D_PWMNGR_FILE_TRANSFER } ExpectedData;
+// TODO: check support for multiple clients on one ip with per-ip verification codes
+typedef struct ThreadData {
+    ExpectedData ed;
+    uint8_t      sent_challenge[CHALLENGE_LEN];
+    char        *ip;
+    SSL         *ssl;
+    uint8_t     *file_recv_buf;
+    uint32_t     file_recv_len;
+} ThreadData;
 
-cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc);
+static cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc);
+static cJSON *finish_update_account(char *email, char *old_email, uint8_t *token, int code, ServerAccount *new_acc);
 
-cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
+static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
 
     cJSON *email_obj          = cJSON_GetObjectItem(request, "email");
     cJSON *request_resend_obj = cJSON_GetObjectItem(request, "request_resend");
     cJSON *username_hash_obj  = cJSON_GetObjectItem(request, "username_hash");
     cJSON *password_hash_obj  = cJSON_GetObjectItem(request, "password_hash");
     cJSON *auth_pk_obj        = cJSON_GetObjectItem(request, "auth_pk");
+    cJSON *auth_seed_id_obj   = cJSON_GetObjectItem(request, "auth_seed_id");
+    cJSON *salt_obj           = cJSON_GetObjectItem(request, "salt");
 
     int email_ok  = email_obj && cJSON_IsString(email_obj);
     int resend_ok = request_resend_obj && cJSON_IsBool(request_resend_obj);
-    int hashes_ok = username_hash_obj && cJSON_IsString(username_hash_obj) && password_hash_obj &&
-                    cJSON_IsString(password_hash_obj) && auth_pk_obj && cJSON_IsString(auth_pk_obj);
+    int data_ok = username_hash_obj && cJSON_IsString(username_hash_obj) && password_hash_obj &&
+                  cJSON_IsString(password_hash_obj) && auth_pk_obj && cJSON_IsString(auth_pk_obj) && auth_seed_id_obj &&
+                  cJSON_IsNumber(auth_seed_id_obj) && salt_obj && cJSON_IsString(salt_obj);
 
-    if (!email_ok || !(resend_ok ^ hashes_ok)) {
-        cJSON *response = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response, "code", E_BADREQ);
-        cJSON_AddStringToObject(response, "err",
-                                "Missing/malformed fields in request! (expected email (str) & (request_resend (bool) "
-                                "^ username_hash (str), password_hash (str), and auth_pk (str))");
-        return response;
+    if (!email_ok || !(resend_ok ^ data_ok)) {
+        return server_error(
+            E_BADREQ, "Missing/malformed fields in request! (expected email (str) & (request_resend "
+                      "(bool) ^ username_hash (str), password_hash (str), auth_pk (str), and auth_seed_id (uint64_t))");
     }
 
     char *email = cJSON_GetStringValue(email_obj);
@@ -659,55 +841,65 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
     uint8_t *username_hash = NULL;
     uint8_t *password_hash = NULL;
     uint8_t *auth_pk       = NULL;
+    uint64_t auth_seed_id  = 0;
+    uint8_t *salt          = NULL;
 
     if (request_resend_obj && request_resend_obj->type == cJSON_True) {
-        if (!smtp_enabled()) {
-            cJSON *response = cJSON_CreateObject();
-            cJSON_AddNumberToObject(response, "code", E_INTERNALERR);
-            cJSON_AddStringToObject(response, "err",
-                                    "Failed to resend email: smtp not enabled. Contact server admins to fix");
-            return response;
-        }
+        if (!smtp_enabled())
+            return server_error(E_INTERNALERR,
+                                "Failed to resend email: smtp not enabled. Contact server admins to fix");
         goto resend_email;
+    }
+
+    if (auth_seed_id_obj) {
+        char *auth_seed_id_str = auth_seed_id_obj->valuestring;
+
+        uint8_t buf[8];
+        for (int i = 0; i < 8; i++)
+            sscanf(auth_seed_id_str + 2 * i, "%2hhx", &buf[i]);
+
+        auth_seed_id = ((uint64_t)buf[0] << 56) | ((uint64_t)buf[1] << 48) | ((uint64_t)buf[2] << 40) |
+                       ((uint64_t)buf[3] << 32) | ((uint64_t)buf[4] << 24) | ((uint64_t)buf[5] << 16) |
+                       ((uint64_t)buf[6] << 8) | ((uint64_t)buf[7]);
     }
 
     int uname_hash_len;
     int passwd_hash_len;
     int auth_pk_len;
+    int salt_len;
 
     username_hash = b64_decode(cJSON_GetStringValue(username_hash_obj), &uname_hash_len);
     password_hash = b64_decode(cJSON_GetStringValue(password_hash_obj), &passwd_hash_len);
     auth_pk       = b64_decode(cJSON_GetStringValue(auth_pk_obj), &auth_pk_len);
+    salt          = b64_decode(cJSON_GetStringValue(salt_obj), &salt_len);
 
-    if (!username_hash || !password_hash || !auth_pk) {
+    if (!username_hash || !password_hash || !auth_pk || auth_seed_id < 2 || !salt) {
         if (username_hash)
             free(username_hash);
         if (password_hash)
             free(password_hash);
         if (auth_pk)
             free(auth_pk);
+        if (salt)
+            free(salt);
 
-        cJSON *response = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response, "code", E_INTERNALERR);
-        cJSON_AddStringToObject(response, "err", "Failed to decode one or more base64 strings from request!");
-        return response;
+        return server_error(E_INTERNALERR, "Failed to decode one or more base64 strings from request!");
     }
 
-    if (uname_hash_len != UNAME_HASH_LEN || passwd_hash_len != PASSWD_HASH_LEN || auth_pk_len != AUTH_PK_LEN) {
+    if (uname_hash_len != UNAME_HASH_LEN || passwd_hash_len != PASSWD_HASH_LEN || auth_pk_len != AUTH_PK_LEN ||
+        auth_seed_id < 2 || salt_len != SALT_LEN) {
 
         free(username_hash);
         free(password_hash);
         free(auth_pk);
+        free(salt);
 
-        cJSON *response = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response, "code", E_BADREQ);
-        char err_msg[150];
+        char err_msg[200];
         sprintf(err_msg,
-                "Invalid length for one or more base64 fields! (expected uname_hash_len == %d, passwd_hash_len == %d, "
-                "and auth_pk_len == %d)",
-                UNAME_HASH_LEN, PASSWD_HASH_LEN, AUTH_PK_LEN);
-        cJSON_AddStringToObject(response, "err", err_msg);
-        return response;
+                "Invalid length for one or more base64 fields, or invalid auth_seed_id! (expected uname_hash_len == "
+                "%d, passwd_hash_len == %d, auth_pk_len == %d, auth_seed_id < 2, and salt_len == %d)",
+                UNAME_HASH_LEN, PASSWD_HASH_LEN, AUTH_PK_LEN, SALT_LEN);
+        return server_error(E_BADREQ, err_msg);
     }
 
     pthread_mutex_lock(&accounts_lock);
@@ -719,11 +911,9 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
             free(username_hash);
             free(password_hash);
             free(auth_pk);
+            free(salt);
 
-            cJSON *response = cJSON_CreateObject();
-            cJSON_AddNumberToObject(response, "code", E_DUPEVAL);
-            cJSON_AddStringToObject(response, "err", "Provided email already exists in accounts database!");
-            return response;
+            return server_error(E_DUPEVAL, "Provided email already exists in accounts database!");
         }
     }
 
@@ -737,11 +927,9 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
         free(username_hash);
         free(password_hash);
         free(auth_pk);
+        free(salt);
 
-        cJSON *response = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response, "code", E_INTERNALERR);
-        cJSON_AddStringToObject(response, "err", "Failed to convert email to wchar to validate!");
-        return response;
+        return server_error(E_INTERNALERR, "Failed to convert email to wchar to validate!");
     }
 
     valid_mail_t email_vld = validate_email(wemail);
@@ -750,6 +938,7 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
         free(username_hash);
         free(password_hash);
         free(auth_pk);
+        free(salt);
 
         char lib_vld_msg[256];
         wcstombs(lib_vld_msg, email_vld.message, sizeof(lib_vld_msg));
@@ -757,10 +946,7 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
         snprintf(msg, sizeof(msg), "Invalid email address: %s", lib_vld_msg);
         msg[strlen(msg) - 1] = 0; // remove '\n'
 
-        cJSON *response = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response, "code", E_INVALIDEMAIL);
-        cJSON_AddStringToObject(response, "err", msg);
-        return response;
+        return server_error(E_INVALIDEMAIL, msg);
     }
 
     if (smtp_enabled()) {
@@ -783,6 +969,8 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
                 } else {
                     free(verification_codes[i].new_acc->email);
                     free(verification_codes[i].new_acc);
+                    if (verification_codes[i].request_ip_src)
+                        free(verification_codes[i].request_ip_src);
                     num_outstanding_codes--;
                     for (int j = i; j < num_outstanding_codes; j++)
                         verification_codes[j] = verification_codes[j + 1];
@@ -806,12 +994,11 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
             code = verification_codes[code].code;
         else {
 
-            if (!username_hash || !password_hash || !auth_pk) { // no code to resend
-                cJSON *response = cJSON_CreateObject();
-                cJSON_AddNumberToObject(response, "code", E_NOCODEFOUND);
-                cJSON_AddStringToObject(response, "err",
-                                        "Failed to find code to resend! Please resend full CREATEACCOUNT request");
-                return response;
+            // no code to resend
+            if (!username_hash || !password_hash || !auth_pk || !salt || !auth_seed_id) {
+                tdata->ed = D_NONE;
+                return server_error(E_NOCODEFOUND,
+                                    "Failed to find code to resend! Please resend full CREATEACCOUNT request");
             }
 
             if (verification_codes)
@@ -827,23 +1014,30 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
             memcpy(verification_codes[code_idx].new_acc->uname_hash, username_hash, UNAME_HASH_LEN);
             memcpy(verification_codes[code_idx].new_acc->passwd_hash, password_hash, PASSWD_HASH_LEN);
             memcpy(verification_codes[code_idx].new_acc->auth_pk, auth_pk, AUTH_PK_LEN);
-            verification_codes[code_idx].new_acc->email_len = strlen(email);
-            verification_codes[code_idx].new_acc->email     = strdup(email);
+            memcpy(verification_codes[code_idx].new_acc->salt, salt, SALT_LEN);
+            verification_codes[code_idx].new_acc->auth_seed_id = auth_seed_id;
+            verification_codes[code_idx].new_acc->email_len    = strlen(email);
+            verification_codes[code_idx].new_acc->email        = strdup(email);
 
             free(username_hash);
             free(password_hash);
             free(auth_pk);
+            free(salt);
 
             code = gen_verification_code();
 
-            verification_codes[code_idx].code        = code;
-            verification_codes[code_idx].expire_time = time(NULL) + 60 * 60; // 1 hour;
+            verification_codes[code_idx].code           = code;
+            verification_codes[code_idx].expire_time    = time(NULL) + 60 * 60; // 1 hour;
+            verification_codes[code_idx].request_ip_src = strdup(tdata->ip);
+            verification_codes[code_idx].type           = D_CA_EMAIL_VERIFICATION_CODE;
         }
 
         if (send_verification_email(email, code) < 0) {
             if (code_idx >= 0) {
                 free(verification_codes[code_idx].new_acc->email);
                 free(verification_codes[code_idx].new_acc);
+                if (verification_codes[code_idx].request_ip_src)
+                    free(verification_codes[code_idx].request_ip_src);
                 if (num_outstanding_codes == 1) {
                     free(verification_codes);
                     verification_codes = NULL;
@@ -855,17 +1049,14 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
 
             pthread_mutex_unlock(&verification_codes_lock);
 
-            cJSON *response = cJSON_CreateObject();
-            cJSON_AddNumberToObject(response, "code", E_INTERNALERR);
-            cJSON_AddStringToObject(response, "err",
-                                    "Failed to send email with verification code! (invalid smtp server configuration; "
-                                    "contact server admins to fix)");
-            return response;
+            return server_error(E_INTERNALERR,
+                                "Failed to send email with verification code! (invalid smtp server configuration; "
+                                "contact server admins to fix)");
         }
 
         pthread_mutex_unlock(&verification_codes_lock);
 
-        *expected_data  = D_CREATEACC_VERIFICATION_CODE;
+        tdata->ed       = D_CA_EMAIL_VERIFICATION_CODE;
         cJSON *response = cJSON_CreateObject();
         cJSON_AddNumberToObject(response, "code", DATA_WAIT);
         return response;
@@ -876,18 +1067,21 @@ cJSON *run_create_account(cJSON *request, ExpectedData *expected_data) {
         memcpy(new_acc->uname_hash, username_hash, UNAME_HASH_LEN);
         memcpy(new_acc->passwd_hash, password_hash, PASSWD_HASH_LEN);
         memcpy(new_acc->auth_pk, auth_pk, AUTH_PK_LEN);
-        new_acc->email_len = strlen(email);
-        new_acc->email     = strdup(email);
+        memcpy(new_acc->salt, salt, SALT_LEN);
+        new_acc->auth_seed_id = auth_seed_id;
+        new_acc->email_len    = strlen(email);
+        new_acc->email        = strdup(email);
 
         free(username_hash);
         free(password_hash);
         free(auth_pk);
+        free(salt);
 
         return finish_create_account(email, -1, new_acc); // -1 = no code required
     }
 }
 
-cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc) {
+static cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc) {
 
     // new_acc only set if no code is required (-1), email is required either way
     if ((code >= 0 && new_acc) || !email) {
@@ -897,12 +1091,8 @@ cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc) {
             free(new_acc);
         }
 
-        cJSON *response = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response, "code", E_INTERNALERR);
-        cJSON_AddStringToObject(response, "err",
-                                "Invalid data passed to finish_create_account! (expected either code OR new_acc "
-                                "struct, as well as valid email pointer)");
-        return response;
+        return server_error(E_INTERNALERR, "Invalid data passed to finish_create_account! (expected either code OR "
+                                           "new_acc struct, as well as valid email pointer)");
     }
 
     if (code >= 0) { // verify code
@@ -914,21 +1104,17 @@ cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc) {
                 if (code != verification_codes[i].code) {
                     pthread_mutex_unlock(&verification_codes_lock);
 
-                    cJSON *response = cJSON_CreateObject();
-                    cJSON_AddNumberToObject(response, "code", E_INVALIDCODE);
-                    cJSON_AddStringToObject(response, "err", "Incorrect verification code for provided email");
-                    return response;
+                    return server_error(E_INVALIDCODE, "Incorrect verification code for provided email");
                 } else if ((time_t)verification_codes[i].expire_time < time(NULL)) {
                     pthread_mutex_unlock(&verification_codes_lock);
 
-                    cJSON *response = cJSON_CreateObject();
-                    cJSON_AddNumberToObject(response, "code", E_EXPIREDCODE);
-                    cJSON_AddStringToObject(response, "err",
-                                            "Verification code expired; try CREATEACCOUNT <email> request_resend=true");
-                    return response;
+                    return server_error(E_EXPIREDCODE,
+                                        "Verification code expired; try CREATEACCOUNT <email> request_resend=true");
                 }
 
                 new_acc = verification_codes[i].new_acc; // now owned by this function
+                if (verification_codes[i].request_ip_src)
+                    free(verification_codes[i].request_ip_src);
 
                 num_outstanding_codes--;
                 for (int j = i; j < num_outstanding_codes; j++)
@@ -944,13 +1130,8 @@ cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc) {
 
         pthread_mutex_unlock(&verification_codes_lock);
 
-        if (!new_acc) {
-            cJSON *response = cJSON_CreateObject();
-            cJSON_AddNumberToObject(response, "code", E_INVALIDDATA);
-            cJSON_AddStringToObject(response, "err",
-                                    "Invalid email address (no associated outstanding verification code)");
-            return response;
-        }
+        if (!new_acc)
+            return server_error(E_INVALIDDATA, "Invalid email address (no associated outstanding verification code)");
     }
 
     new_acc->user_id = get_next_user_id();
@@ -961,27 +1142,643 @@ cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc) {
     accounts = (num_accounts - 1) ? ec_realloc(accounts, sizeof(ServerAccount) * num_accounts)
                                   : ec_malloc(sizeof(ServerAccount));
 
+    accounts_modified = 1;
+
     // transfers ownership of char *email to accounts array
     accounts[num_accounts - 1] = *new_acc;
 
-    accounts_modified = 1;
+    pthread_mutex_unlock(&accounts_lock);
+
+    char *token_b64 = assign_token(new_acc->user_id);
+    free(new_acc);
+
+    if (!token_b64)
+        return server_error(E_INTERNALERR, "Failed to generate token/encode it as base64! Your account has been "
+                                           "successfully created, but no token could be returned.");
+
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+    cJSON_AddStringToObject(response, "token", token_b64);
+    free(token_b64);
+    return response;
+}
+
+static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
+
+    cJSON *token_check = check_token(request);
+    if (token_check)
+        return token_check;
+
+    // safe because token_check asserts valid email
+    char    *email = cJSON_GetStringValue(cJSON_GetObjectItem(request, "email"));
+    uint32_t uid   = get_uid(email);
+    if (!uid)
+        return server_error(E_NOACCOUNT, "Failed to get uid from email!");
+
+    cJSON *request_resend_obj    = cJSON_GetObjectItem(request, "request_resend");
+    cJSON *new_email_obj         = cJSON_GetObjectItem(request, "new_email");
+    cJSON *new_username_hash_obj = cJSON_GetObjectItem(request, "new_username_hash");
+    cJSON *new_password_hash_obj = cJSON_GetObjectItem(request, "new_password_hash");
+    cJSON *new_auth_pk_obj       = cJSON_GetObjectItem(request, "new_auth_pk");
+    cJSON *new_auth_seed_id_obj  = cJSON_GetObjectItem(request, "new_auth_seed_id");
+    cJSON *new_salt_obj          = cJSON_GetObjectItem(request, "new_salt");
+
+    int has_update_data =
+        (new_username_hash_obj || new_password_hash_obj || new_auth_pk_obj || new_auth_seed_id_obj || new_salt_obj);
+
+    if (request_resend_obj && !cJSON_IsBool(request_resend_obj))
+        return server_error(E_BADREQ, "Invalid data type for request_resend! (expected bool)");
+
+    if (request_resend_obj && has_update_data)
+        return server_error(E_BADREQ, "If request_resend is set, only email, token, and new_email should be sent!");
+
+    char *new_email = NULL; // owned by cJSON
+    if (new_email_obj) {
+        if (!cJSON_IsString(new_email_obj))
+            return server_error(E_BADREQ, "Invalid type for new_email! (expected string)");
+
+        new_email = cJSON_GetStringValue(new_email_obj);
+    }
+
+    ServerAccount *new_acc = NULL; // declare here to fix warnings
+
+    int resend = 0;
+    if (request_resend_obj->type == cJSON_True) {
+
+        if (!new_email)
+            return server_error(E_BADREQ, "Missing field 'new_email'!");
+
+        resend = 1;
+        goto resend_update_code;
+    }
+
+    if (!new_auth_pk_obj || !cJSON_IsString(new_auth_pk_obj) || !new_auth_seed_id_obj ||
+        !cJSON_IsNumber(new_auth_seed_id_obj))
+        return server_error(E_BADREQ, "You must update auth_pk on every account update");
+
+    uint8_t buf[8];
+    for (int i = 0; i < 8; i++)
+        sscanf(new_auth_seed_id_obj->valuestring + 2 * i, "%2hhx", &buf[i]);
+
+    uint64_t new_auth_seed_id = ((uint64_t)buf[0] << 56) | ((uint64_t)buf[1] << 48) | ((uint64_t)buf[2] << 40) |
+                                ((uint64_t)buf[3] << 32) | ((uint64_t)buf[4] << 24) | ((uint64_t)buf[5] << 16) |
+                                ((uint64_t)buf[6] << 8) | ((uint64_t)buf[7]);
+    if (new_auth_seed_id < 2)
+        return server_error(E_BADREQ, "Invalid auth_seed_id (must be > 1)");
+
+    int      auth_pk_len;
+    uint8_t *new_auth_pk = b64_decode(cJSON_GetStringValue(new_auth_pk_obj), &auth_pk_len);
+    if (!new_auth_pk || auth_pk_len != AUTH_PK_LEN) {
+        if (new_auth_pk)
+            free(new_auth_pk);
+
+        return server_error(E_INTERNALERR, "Failed to decode base64 auth_pk/invalid length");
+    }
+
+    uint8_t *new_username_hash = NULL;
+    uint8_t *new_password_hash = NULL;
+    uint8_t *new_salt          = NULL;
+
+    if (new_username_hash_obj) {
+        if (!cJSON_IsString(new_username_hash_obj)) {
+            free(new_auth_pk);
+            return server_error(E_BADREQ, "Invalid type for new_username_hash! (expected string)");
+        }
+
+        int username_hash_len;
+        new_username_hash = b64_decode(cJSON_GetStringValue(new_username_hash_obj), &username_hash_len);
+
+        if (!new_username_hash || username_hash_len != UNAME_HASH_LEN) {
+            if (new_username_hash)
+                free(new_username_hash);
+            free(new_auth_pk);
+            return server_error(E_INTERNALERR, "Failed to decode base64 new_username_hash/invalid length");
+        }
+    }
+
+    if (new_password_hash_obj) {
+        if (!cJSON_IsString(new_password_hash_obj)) {
+            free(new_auth_pk);
+            free(new_username_hash);
+            return server_error(E_BADREQ, "Invalid type for new_password_hash! (expected string)");
+        }
+
+        int password_hash_len;
+        new_password_hash = b64_decode(cJSON_GetStringValue(new_password_hash_obj), &password_hash_len);
+
+        if (!new_password_hash || password_hash_len != PASSWD_HASH_LEN) {
+            if (new_username_hash)
+                free(new_username_hash);
+            free(new_auth_pk);
+            if (new_password_hash)
+                free(new_password_hash);
+            return server_error(E_INTERNALERR, "Failed to decode base64 new_password_hash/invalid length");
+        }
+    }
+
+    if (new_salt) {
+        if (!cJSON_IsString(new_salt_obj)) {
+            free(new_auth_pk);
+            free(new_username_hash);
+            free(new_password_hash);
+            return server_error(E_BADREQ, "Invalid type for new_salt! (expected string)");
+        }
+
+        int salt_len;
+        new_salt = b64_decode(new_salt_obj->valuestring, &salt_len);
+
+        if (!new_salt || salt_len != SALT_LEN) {
+            if (new_salt)
+                free(new_salt);
+            free(new_auth_pk);
+            if (new_username_hash)
+                free(new_username_hash);
+            if (new_password_hash)
+                free(new_password_hash);
+            return server_error(E_INTERNALERR, "Failed to decode base64 new_salt/invalid length");
+        }
+    }
+
+    new_acc = ec_calloc(1, sizeof(ServerAccount));
+
+    pthread_mutex_lock(&accounts_lock);
+
+    for (int i = 0; i < num_accounts; i++) {
+        if (accounts[i].user_id == uid) { // copy account
+            *new_acc       = accounts[i];
+            new_acc->email = strdup(accounts[i].email);
+            break;
+        }
+    }
 
     pthread_mutex_unlock(&accounts_lock);
 
-    pthread_mutex_lock(&tokens_lock);
-    uint8_t *token = assign_token(new_acc->user_id);
-    pthread_mutex_unlock(&tokens_lock);
+    if (!new_acc->user_id) {
+        free(new_acc);
+        if (new_username_hash)
+            free(new_username_hash);
+        if (new_password_hash)
+            free(new_password_hash);
+        free(new_auth_pk);
+        return server_error(E_NOACCOUNT, "Failed to retrieve account from uid! Please try again");
+    }
 
-    free(new_acc);
+    if (!memcmp(new_auth_pk, new_acc->auth_pk, AUTH_PK_LEN) || new_acc->auth_seed_id == new_auth_seed_id) {
+        free(new_acc->email);
+        free(new_acc);
+        if (new_username_hash)
+            free(new_username_hash);
+        if (new_password_hash)
+            free(new_password_hash);
+        free(new_auth_pk);
+        return server_error(
+            E_BADREQ, "new auth_pk & auth_seed_id must be different from current auth_pk & auth_seed_id! (nice try)");
+    }
 
-    char *token_b64 = b64_encode(token, TOKEN_LEN);
-    if (!token_b64) {
+    new_acc->auth_seed_id = new_auth_seed_id;
+    memcpy(new_acc->auth_pk, new_auth_pk, AUTH_PK_LEN);
+    free(new_auth_pk);
+    if (new_username_hash) {
+        memcpy(new_acc->uname_hash, new_username_hash, UNAME_HASH_LEN);
+        free(new_username_hash);
+    }
+    if (new_password_hash) {
+        memcpy(new_acc->passwd_hash, new_password_hash, PASSWD_HASH_LEN);
+        free(new_password_hash);
+    }
+    if (new_salt) {
+        memcpy(new_acc->salt, new_salt, SALT_LEN);
+        free(new_salt);
+    }
+
+    if (new_email && strcmp(new_email, new_acc->email)) {
+
+        free(new_acc->email);
+        new_acc->email = strdup(new_email);
+
+        pthread_mutex_lock(&accounts_lock);
+        for (int i = 0; i < num_accounts; i++) {
+            if (!strcmp(accounts[i].email, new_email)) {
+
+                pthread_mutex_unlock(&accounts_lock);
+
+                free(new_acc->email);
+                free(new_acc);
+
+                return server_error(E_DUPEVAL, "Provided email already exists in accounts database!");
+            }
+        }
+
+        pthread_mutex_unlock(&accounts_lock);
+
+        wchar_t wemail[320];
+        size_t  converted = mbstowcs(wemail, new_email, sizeof(wemail) / sizeof(wchar_t));
+
+        if (converted == (size_t)-1 || converted >= 320) {
+
+            free(new_acc->email);
+            free(new_acc);
+
+            return server_error(E_INTERNALERR, "Failed to convert new email to wchar to validate!");
+        }
+
+        valid_mail_t email_vld = validate_email(wemail);
+        if (!email_vld.success) {
+
+            free(new_acc->email);
+            free(new_acc);
+
+            char lib_vld_msg[256];
+            wcstombs(lib_vld_msg, email_vld.message, sizeof(lib_vld_msg));
+            char msg[300];
+            snprintf(msg, sizeof(msg), "Invalid email address: %s", lib_vld_msg);
+            msg[strlen(msg) - 1] = 0; // remove '\n'
+
+            return server_error(E_INVALIDEMAIL, msg);
+        }
+
+        if (smtp_enabled()) {
+
+        resend_update_code:
+
+            pthread_mutex_lock(&verification_codes_lock);
+
+            int code = -1;
+            for (int i = 0; i < num_outstanding_codes; i++) {
+                if ((time_t)verification_codes[i].expire_time < time(NULL)) {
+                    if (resend && !strcmp(new_email, verification_codes[i].new_acc->email)) {
+                        verification_codes[i].code        = gen_verification_code();
+                        verification_codes[i].expire_time = time(NULL) + (60 * 60);
+
+                        code = i;
+                    } else {
+                        free(verification_codes[i].new_acc->email);
+                        free(verification_codes[i].new_acc);
+                        if (verification_codes[i].request_ip_src)
+                            free(verification_codes[i].request_ip_src);
+                        num_outstanding_codes--;
+                        for (int j = i; j < num_outstanding_codes; j++)
+                            verification_codes[j] = verification_codes[j + 1];
+                        if (num_outstanding_codes == 0) {
+                            free(verification_codes);
+                            verification_codes = NULL;
+                        } else
+                            verification_codes =
+                                ec_realloc(verification_codes, num_outstanding_codes * sizeof(EmailVerificationCode));
+                        i--;
+                    }
+                    continue;
+                }
+                if (!strcmp(verification_codes[i].new_acc->email, new_email))
+                    code = i;
+            }
+
+            int code_idx = -1;
+
+            if (code >= 0)
+                code = verification_codes[code].code;
+            else {
+
+                // no code to resend
+                if (resend) {
+                    tdata->ed = D_NONE;
+                    return server_error(E_NOCODEFOUND,
+                                        "Failed to find code to resend! Please retry full UPDATEACCOUNT request");
+                }
+
+                if (verification_codes)
+                    verification_codes =
+                        ec_realloc(verification_codes, ++num_outstanding_codes * sizeof(EmailVerificationCode));
+                else
+                    verification_codes = ec_calloc((num_outstanding_codes = 1), sizeof(EmailVerificationCode));
+
+                code_idx = num_outstanding_codes - 1;
+
+                verification_codes[code_idx].new_acc = new_acc;
+
+                code = gen_verification_code();
+
+                verification_codes[code_idx].code           = code;
+                verification_codes[code_idx].expire_time    = time(NULL) + 60 * 60; // 1 hour;
+                verification_codes[code_idx].request_ip_src = strdup(tdata->ip);
+                verification_codes[code_idx].type           = D_UA_EMAIL_VERIFICATION_CODE;
+            }
+
+            if (send_verification_email(email, code) < 0) {
+                if (code_idx >= 0) {
+                    free(verification_codes[code_idx].new_acc->email);
+                    free(verification_codes[code_idx].new_acc);
+                    free(verification_codes[code_idx].request_ip_src);
+                    if (num_outstanding_codes == 1) {
+                        free(verification_codes);
+                        verification_codes = NULL;
+                        num_outstanding_codes--;
+                    } else
+                        verification_codes =
+                            ec_realloc(verification_codes, --num_outstanding_codes * sizeof(EmailVerificationCode));
+                }
+
+                pthread_mutex_unlock(&verification_codes_lock);
+
+                return server_error(E_INTERNALERR,
+                                    "Failed to send email with verification code! (invalid smtp server configuration; "
+                                    "contact server admins to fix)");
+            }
+
+            pthread_mutex_unlock(&verification_codes_lock);
+
+            tdata->ed = D_UA_EMAIL_VERIFICATION_CODE;
+
+            cJSON *response = cJSON_CreateObject();
+            cJSON_AddNumberToObject(response, "code", DATA_WAIT);
+            return response;
+        } else {
+
+            int      token_len;
+            uint8_t *token = b64_decode(cJSON_GetStringValue(cJSON_GetObjectItem(request, "token")), &token_len);
+            if (!token || token_len != TOKEN_LEN) {
+                free(new_acc->email);
+                free(new_acc);
+                if (token)
+                    free(token);
+                return server_error(E_BADTOKEN, "Failed to decode base64 token! (OOM/invalid length)");
+            }
+
+            return finish_update_account(new_email, email, token, -1, new_acc); // -1 = no code required
+        }
+
+    } else {
+
+        int success = 0;
+
+        pthread_mutex_lock(&accounts_lock);
+
+        for (int i = 0; i < num_accounts; i++) {
+            if (accounts[i].user_id == uid) {
+                accounts_modified = 1;
+                free(accounts[i].email);
+                accounts[i] = *new_acc;
+                free(new_acc);
+                success = 1;
+            }
+        }
+
+        pthread_mutex_unlock(&accounts_lock);
+
+        if (!success) {
+            free(new_acc->email);
+            free(new_acc);
+            return server_error(E_NOACCOUNT, "Failed to find account to update from uid! (changed by another thread)");
+        }
+
         cJSON *response = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response, "code", E_INTERNALERR);
-        cJSON_AddStringToObject(response, "err",
-                                "Failed to encode token as base64! Your account has been successfully created and a "
-                                "token was assigned, but it could not be returned.");
+        cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
         return response;
+    }
+}
+
+static cJSON *finish_update_account(char *email, char *old_email, uint8_t *token, int code, ServerAccount *new_acc) {
+    cJSON *token_check = check_raw_token(old_email, token);
+    if (token_check)
+        return token_check;
+
+    if ((code >= 0 && new_acc) || !email) {
+
+        if (new_acc) {
+            free(new_acc->email);
+            free(new_acc);
+        }
+
+        return server_error(E_INTERNALERR, "Invalid data passed to finish_update_account! (expected either code OR "
+                                           "new_acc struct, as well as valid email pointer)");
+    }
+
+    if (code >= 0) { // verify code
+
+        pthread_mutex_lock(&verification_codes_lock);
+
+        for (int i = 0; i < num_outstanding_codes; i++) {
+            if (!strcmp(email, verification_codes[i].new_acc->email)) {
+                if (code != verification_codes[i].code) {
+                    pthread_mutex_unlock(&verification_codes_lock);
+
+                    return server_error(E_INVALIDCODE, "Incorrect verification code for provided email");
+                } else if ((time_t)verification_codes[i].expire_time < time(NULL)) {
+                    pthread_mutex_unlock(&verification_codes_lock);
+
+                    return server_error(
+                        E_EXPIREDCODE,
+                        "Verification code expired; try UPDATEACCOUNT <email> <token> <new_email> request_resend=true");
+                }
+
+                new_acc = verification_codes[i].new_acc; // now owned by this function
+                if (verification_codes[i].request_ip_src)
+                    free(verification_codes[i].request_ip_src);
+
+                num_outstanding_codes--;
+                for (int j = i; j < num_outstanding_codes; j++)
+                    verification_codes[j] = verification_codes[j + 1];
+                if (num_outstanding_codes == 0) {
+                    free(verification_codes);
+                    verification_codes = NULL;
+                } else
+                    verification_codes =
+                        ec_realloc(verification_codes, num_outstanding_codes * sizeof(EmailVerificationCode));
+            }
+        }
+
+        pthread_mutex_unlock(&verification_codes_lock);
+
+        if (!new_acc)
+            return server_error(E_INVALIDDATA, "Invalid email address (no associated outstanding verification code)");
+    }
+
+    uint32_t uid = get_uid(old_email);
+    if (!uid) {
+        free(new_acc->email);
+        free(new_acc);
+
+        return server_error(E_NOACCOUNT, "Failed to fetch uid from old email!");
+    }
+
+    int success = 0;
+
+    pthread_mutex_lock(&accounts_lock);
+
+    for (int i = 0; i < num_accounts; i++) {
+        if (accounts[i].user_id == uid) {
+            accounts_modified = 1;
+            free(accounts[i].email);
+            accounts[i] = *new_acc;
+            free(new_acc);
+            success = 1;
+        }
+    }
+
+    pthread_mutex_unlock(&accounts_lock);
+
+    if (!success) {
+        free(new_acc->email);
+        free(new_acc);
+        return server_error(E_INTERNALERR, "Failed to find account to update from uid! (changed by another thread)");
+    }
+
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+    return response;
+}
+
+// client can call CREATEACCOUNT again if it wants to support non-permanent deletes
+static cJSON *run_delete_account(cJSON *request) {
+
+    cJSON *token_check = check_token(request);
+    if (token_check)
+        return token_check;
+
+    // token check asserts valid email
+    char    *email = cJSON_GetStringValue(cJSON_GetObjectItem(request, "email"));
+    uint32_t uid   = get_uid(email);
+    if (!uid)
+        return server_error(E_NOACCOUNT, "Failed to get uid from email! (modified by another thread)");
+
+    int success = 0;
+
+    pthread_mutex_lock(&accounts_lock);
+
+    for (int i = 0; i < num_accounts; i++) {
+        if (accounts[i].user_id == uid) {
+            accounts_modified = 1;
+            free(accounts[i].email);
+            num_accounts--;
+            for (int j = i; j < num_accounts; j++)
+                accounts[j] = accounts[j + 1];
+            if (!num_accounts) {
+                free(accounts);
+                accounts = NULL;
+            } else
+                accounts = ec_realloc(accounts, num_accounts * sizeof(ServerAccount));
+            success = 1;
+        }
+    }
+
+    pthread_mutex_unlock(&accounts_lock);
+
+    // very unlikely but possible (assuming malicious scheduling + requests)
+    if (!success)
+        return server_error(E_NOACCOUNT, "Failed to find account from uid! (modified by another thread)");
+
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+    return response;
+}
+
+static cJSON *run_import_account(cJSON *request) {
+
+    cJSON *token_check = check_token(request);
+    if (token_check)
+        return token_check;
+
+    uint32_t uid = get_uid(cJSON_GetObjectItem(request, "email")->valuestring);
+
+    ServerAccount *acc = ec_calloc(1, sizeof(ServerAccount));
+
+    pthread_mutex_lock(&accounts_lock);
+
+    for (int i = 0; i < num_accounts; i++) {
+        if (accounts[i].user_id == uid) {
+            *acc = accounts[i]; // ignore email; it isn't used
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&accounts_lock);
+
+    if (!acc->user_id) {
+        free(acc);
+        return server_error(E_NOACCOUNT, "No account found for provided email!");
+    }
+
+    char *uname_hash_b64  = b64_encode(acc->uname_hash, UNAME_HASH_LEN);
+    char *passwd_hash_b64 = b64_encode(acc->passwd_hash, PASSWD_HASH_LEN);
+    char *auth_pk_b64     = b64_encode(acc->auth_pk, AUTH_PK_LEN);
+    if (!uname_hash_b64 || !passwd_hash_b64 || !auth_pk_b64) {
+        free(acc);
+        if (uname_hash_b64)
+            free(uname_hash_b64);
+        if (passwd_hash_b64)
+            free(passwd_hash_b64);
+        if (auth_pk_b64)
+            free(auth_pk_b64);
+
+        return server_error(E_INTERNALERR, "Failed to encode one or more fields as base64! (OOM/bad data)");
+    }
+
+    char auth_seed_id_str[25];
+
+    for (int i = 0; i / 2 < (int)sizeof(uint64_t); i += 2)
+        snprintf(auth_seed_id_str + i, sizeof(auth_seed_id_str) - i, "%02x",
+                 *(uint8_t *)(((uint8_t *)&acc->auth_seed_id) + i));
+
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+    cJSON_AddStringToObject(response, "uname_hash", uname_hash_b64);
+    cJSON_AddStringToObject(response, "passwd_hash", passwd_hash_b64);
+    cJSON_AddStringToObject(response, "auth_pk", auth_pk_b64);
+    cJSON_AddStringToObject(response, "auth_seed_id", auth_seed_id_str);
+    return response;
+}
+
+static cJSON *run_auth(cJSON *request, ThreadData *td) {
+
+    cJSON *email_obj = cJSON_GetObjectItem(request, "email");
+
+    if (!email_obj || !cJSON_IsString(email_obj))
+        return server_error(E_BADREQ, "No email provided!");
+
+    uint32_t uid = get_uid(cJSON_GetStringValue(email_obj));
+    if (!uid)
+        return server_error(E_NOACCOUNT, "No account found for provided email!");
+
+    uint8_t challenge[CHALLENGE_LEN];
+    randombytes_buf(challenge, CHALLENGE_LEN);
+    char *challenge_b64 = b64_encode(challenge, CHALLENGE_LEN);
+    if (!challenge_b64)
+        return server_error(E_INTERNALERR, "Failed to encode challenge as base64 string; please try again");
+
+    td->ed = D_CHALLENGE_RESPONSE;
+    memcpy(td->sent_challenge, challenge, CHALLENGE_LEN);
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", DATA_WAIT);
+    cJSON_AddStringToObject(response, "challenge", challenge_b64);
+    free(challenge_b64);
+    return response;
+}
+
+static cJSON *finish_auth(uint32_t uid, uint8_t *signature, ThreadData *td) {
+
+    uint8_t *auth_pk = NULL;
+
+    pthread_mutex_lock(&accounts_lock);
+    for (int i = 0; i < num_accounts; i++)
+        if (accounts[i].user_id == uid)
+            auth_pk = accounts[i].auth_pk;
+    pthread_mutex_unlock(&accounts_lock);
+
+    if (!auth_pk) {
+        td->ed = D_NONE;
+        return server_error(E_INTERNALERR, "Failed to fetch auth_pk from account by uid; please try again");
+    }
+
+    if (crypto_sign_verify_detached(signature, td->sent_challenge, CHALLENGE_LEN, auth_pk)) {
+        td->ed = D_NONE;
+        return server_error(E_BADSIGNATURE, "Challenge verification failed: invalid signature");
+    }
+
+    char *token_b64 = assign_token(uid);
+
+    if (!token_b64) {
+        td->ed = D_NONE;
+        return server_error(E_INTERNALERR, "Failed to assign token/convert it to base64; please try again");
     }
 
     cJSON *response = cJSON_CreateObject();
@@ -991,33 +1788,464 @@ cJSON *finish_create_account(char *email, int code, ServerAccount *new_acc) {
     return response;
 }
 
-cJSON *run_update_account(cJSON *request) {
+// invalidate all tokens for an account (but requires a token to run) - used to secure account after token leak
+static cJSON *run_invalidate_tokens(cJSON *request) {
+
+    cJSON *token_check = check_token(request);
+    if (token_check)
+        return token_check;
+
+    uint32_t uid = get_uid(cJSON_GetObjectItem(request, "email")->valuestring);
+
+    pthread_mutex_lock(&tokens_lock);
+
+    int tok_start_num = num_tokens;
+
+    for (int i = 0; i < num_tokens; i++) {
+        if (tokens[i].user_id == uid) {
+            tokens_modified = 1;
+            num_tokens--;
+            if (num_tokens == 0) {
+                free(tokens);
+                tokens = NULL;
+            } else {
+                for (int j = i; j < num_tokens; j++)
+                    tokens[j] = tokens[j + 1];
+                tokens = ec_realloc(tokens, num_tokens * sizeof(AuthToken));
+                i--;
+            }
+        }
+    }
+
+    int num_tokens_removed = num_tokens - tok_start_num;
+
+    pthread_mutex_unlock(&tokens_lock);
+
     cJSON *response = cJSON_CreateObject();
     cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+    cJSON_AddNumberToObject(response, "tokens_removed", num_tokens_removed);
     return response;
 }
 
-cJSON *run_auth(cJSON *request) {
+// get data for key derivation (salt + auth_seed_id)
+static cJSON *run_get_account_info(cJSON *request) {
+
+    cJSON *email_obj = cJSON_GetObjectItem(request, "email");
+    if (!email_obj || !cJSON_IsString(email_obj))
+        return server_error(E_BADREQ, "Missing/invalid field 'email'! (expected string)");
+
+    uint32_t uid = get_uid(email_obj->valuestring);
+    if (!uid)
+        return server_error(E_NOACCOUNT, "No account found for provided email!");
+
+    uint64_t auth_seed_id = 0;
+    uint8_t  salt[SALT_LEN];
+
+    pthread_mutex_lock(&accounts_lock);
+
+    for (int i = 0; i < num_accounts; i++) {
+        if (accounts[i].user_id == uid) {
+            auth_seed_id = accounts[i].auth_seed_id;
+            memcpy(salt, accounts[i].salt, SALT_LEN);
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&accounts_lock);
+
+    if (!auth_seed_id)
+        return server_error(E_NOACCOUNT, "Failed to find account from uid! (modified by another thread)");
+
+    char *salt_b64 = b64_encode(salt, SALT_LEN);
+    if (!salt_b64)
+        return server_error(E_INTERNALERR, "Failed to encode salt as base64! (OOM)");
+
+    // hex string because cJSON doesn't support uint64_t
+    char auth_seed_id_str[25];
+
+    for (int i = 0; i / 2 < (int)sizeof(uint64_t); i += 2)
+        snprintf(auth_seed_id_str + i, sizeof(auth_seed_id_str) - i, "%02x",
+                 *(uint8_t *)(((uint8_t *)&auth_seed_id) + i));
+
     cJSON *response = cJSON_CreateObject();
     cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+    cJSON_AddStringToObject(response, "auth_seed_id", auth_seed_id_str);
+    cJSON_AddStringToObject(response, "salt", salt_b64);
     return response;
 }
 
-int handle_request(char *request, int request_len, char *response_buf, size_t response_buf_len,
-                   ExpectedData *expected_data) {
+// expected vault type
+#define VAULT_MAGIC "PWMNGR"
+#define VAULT_VERSION 2
+
+static cJSON *run_get_vault(cJSON *request, ThreadData *tdata,
+                            void(send_packet)(SSL *ssl, const uint8_t *data, const uint16_t data_len)) {
+
+    cJSON *token_check = check_token(request);
+    if (token_check)
+        return token_check;
+
+    cJSON *force_obj = cJSON_GetObjectItem(request, "force");
+    int    force     = 0;
+    if (force_obj && cJSON_IsBool(force_obj) && force_obj->type == cJSON_True)
+        force = 1;
+
+    cJSON *timestamp_obj = cJSON_GetObjectItem(request, "last_known_timestamp");
+    if (!timestamp_obj || !cJSON_IsString(timestamp_obj))
+        return server_error(E_BADREQ, "Missing last_known_timestamp! (used to check if vault needs to be sent; "
+                                      "expected string representation of hex time_t)");
+
+    char *client_timestamp_str = timestamp_obj->valuestring;
+
+    if (strlen(client_timestamp_str) != 16)
+        return server_error(E_BADREQ, "Invalid timestamp string!");
+
+    uint8_t tm_buf[8];
+    for (int i = 0; i < 8; i++)
+        sscanf(client_timestamp_str + 2 * i, "%2hhx", &tm_buf[i]);
+
+    time_t client_timestamp = ((time_t)tm_buf[0] << 56) | ((time_t)tm_buf[1] << 48) | ((time_t)tm_buf[2] << 40) |
+                              ((time_t)tm_buf[3] << 32) | ((time_t)tm_buf[4] << 24) | ((time_t)tm_buf[5] << 16) |
+                              ((time_t)tm_buf[6] << 8) | ((time_t)tm_buf[7]);
+
+    if (client_timestamp > time(NULL))
+        return server_error(E_BADREQ, "Invalid timestamp! (time in the future)");
+
+    char *vault_path = ec_malloc(strlen(VAULTS_DIR) + HASH_LEN * 2 + strlen(".pwmngr") + 1);
+    char *email_hash = hash_email(cJSON_GetObjectItem(request, "email")->valuestring);
+    sprintf(vault_path, "%s%s.pwmngr", VAULTS_DIR, email_hash);
+    free(email_hash);
+
+    lock_file(vault_path);
+
+    FILE *fp = fopen(vault_path, "rb");
+    if (!fp) {
+        unlock_file(vault_path);
+        free(vault_path);
+        L_ERROR("Failed to open user vault!");
+        return server_error(E_INTERNALERR, "Failed to open user vault! (vault does not exist)");
+    }
+
+    // TODO: read once instead of verifying then sending
+
+    fseek(fp, 0, SEEK_END);
+    long fsize           = ftell(fp);
+    long remaining_bytes = fsize;
+    fseek(fp, 0, SEEK_SET);
+
+    if (fsize < (long)sizeof(VaultHeader)) {
+        fclose(fp);
+        unlock_file(vault_path);
+        free(vault_path);
+
+        return server_error(E_BADVAULT, "Vault to small to contain header!");
+    }
+
+    VaultHeader *hdr = ec_malloc(fsize);
+    fread((uint8_t *)hdr, 1, fsize, fp); // read the whole file first, to verify hash
+    fseek(fp, 0, SEEK_SET);
+
+    if (memcmp(hdr->magic, VAULT_MAGIC, 6)) {
+        fclose(fp);
+        unlock_file(vault_path);
+        free(vault_path);
+        free(hdr);
+
+        return server_error(E_BADVAULT, "Invalid vault magic!");
+    }
+
+    if (hdr->version != VAULT_VERSION) {
+        fclose(fp);
+        unlock_file(vault_path);
+        free(vault_path);
+        free(hdr);
+
+        return server_error(E_BADVAULT, "Invalid vault version!");
+    }
+
+    uint8_t *hash = sha_256_hash((uint8_t *)hdr + 10 + HASH_LEN, fsize - 10 - HASH_LEN);
+    if (!hash) {
+        fclose(fp);
+        unlock_file(vault_path);
+        free(vault_path);
+        free(hdr);
+
+        return server_error(E_INTERNALERR, "Failed to hash vault data!");
+    }
+
+    if (memcmp(hash, hdr->hash, HASH_LEN)) {
+        if (force)
+            L_WARN("Vault has invalid hash, but force is set; sending anyway!");
+        else {
+            fclose(fp);
+            unlock_file(vault_path);
+            free(vault_path);
+            free(hash);
+            free(hdr);
+
+            return server_error(E_BADVAULT, "Verification failed for vault: invalid hash!");
+        }
+    }
+
+    free(hash);
+
+    if ((time_t)hdr->timestamp < client_timestamp) {
+        if (force)
+            L_WARN("Client has newer vault than server, but force is set; sending anyway!");
+        else {
+            cJSON *response = cJSON_CreateObject();
+            cJSON_AddNumberToObject(response, "code", E_VAULTUPTODATE);
+            cJSON_AddBoolToObject(response, "client_has_newer_version", 1);
+
+            fclose(fp);
+            unlock_file(vault_path);
+            free(vault_path);
+            free(hdr);
+
+            return response;
+        }
+    }
+
+    free(hdr);
+
+// max bytes to send in a packet
+#define CHUNK_SIZE 4096
+    while (remaining_bytes > 0) {
+
+        uint16_t sent_bytes = MIN(remaining_bytes, CHUNK_SIZE);
+        uint8_t  buf[CHUNK_SIZE + 4 + sizeof(uint16_t)];
+        memcpy(buf, "DATA", 4);
+        memcpy(buf + 4, (uint8_t *)&sent_bytes, sizeof(uint16_t));
+        fread(buf + 4 + sizeof(uint16_t), 1, sent_bytes, fp);
+
+        send_packet(tdata->ssl, buf, sent_bytes);
+
+        remaining_bytes -= sent_bytes;
+    }
+
+    fclose(fp);
+
+    unlock_file(vault_path);
+    free(vault_path);
+
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+    cJSON_AddNumberToObject(response, "bytes_sent", (int)fsize);
+    return response;
+}
+
+static cJSON *run_push_vault(cJSON *request, ThreadData *tdata) {
+
+    cJSON *token_check = check_token(request);
+    if (token_check)
+        return token_check;
+
+    cJSON *timestamp_obj = cJSON_GetObjectItem(request, "vault_timestamp");
+    if (!timestamp_obj || !cJSON_IsString(timestamp_obj))
+        return server_error(E_BADREQ, "Missing vault modification timestamp!");
+
+    if (strlen(timestamp_obj->valuestring) != 16)
+        return server_error(E_BADREQ, "Invalid timestamp string!");
+
+    uint8_t tm_buf[8];
+    for (int i = 0; i < 8; i++)
+        sscanf(timestamp_obj->valuestring + 2 * i, "%2hhx", &tm_buf[i]);
+
+    time_t client_timestamp = ((time_t)tm_buf[0] << 56) | ((time_t)tm_buf[1] << 48) | ((time_t)tm_buf[2] << 40) |
+                              ((time_t)tm_buf[3] << 32) | ((time_t)tm_buf[4] << 24) | ((time_t)tm_buf[5] << 16) |
+                              ((time_t)tm_buf[6] << 8) | ((time_t)tm_buf[7]);
+
+    if (client_timestamp > time(NULL))
+        return server_error(E_BADREQ, "Invalid timestamp! (time in the future)");
+
+    char *vault_path = ec_malloc(strlen(VAULTS_DIR) + HASH_LEN * 2 + strlen(".pwmngr") + 1);
+    char *email_hash = hash_email(cJSON_GetObjectItem(request, "email")->valuestring);
+    sprintf(vault_path, "%s%s.pwmngr", VAULTS_DIR, email_hash);
+    free(email_hash);
+    lock_file(vault_path);
+    FILE *fp = fopen(vault_path, "w");
+    if (!fp) {
+        unlock_file(vault_path);
+        free(vault_path);
+        L_ERROR("Failed to open/create user vault!");
+        return server_error(E_INTERNALERR, "Failed to open/create user vault!");
+    }
+    fclose(fp);
+    fp = fopen(vault_path, "rb");
+    if (!fp) {
+        unlock_file(vault_path);
+        free(vault_path);
+        L_ERROR("Failed to open user vault for reading!");
+        return server_error(E_INTERNALERR, "Failed to open user vault for reading!");
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (fsize >= (long)sizeof(VaultHeader)) {
+
+        VaultHeader *hdr = ec_calloc(1, sizeof(VaultHeader));
+        fread(hdr, 1, sizeof(VaultHeader), fp);
+
+        if ((time_t)hdr->timestamp > client_timestamp) {
+            cJSON *response = cJSON_CreateObject();
+            cJSON_AddNumberToObject(response, "code", E_VAULTUPTODATE);
+            cJSON_AddBoolToObject(response, "server_has_newer_version", 1);
+
+            fclose(fp);
+            unlock_file(vault_path);
+            free(vault_path);
+
+            return response;
+        }
+    }
+
+    fclose(fp);
+
+    unlock_file(vault_path);
+    free(vault_path);
+
+    tdata->ed = D_PWMNGR_FILE_TRANSFER;
+
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", DATA_WAIT);
+    return response;
+}
+
+void send_pwmngr_file_packet(SSL *ssl, uint8_t *data, uint16_t data_len) {
+    if (SSL_write(ssl, data, data_len) <= 0) {
+        openssl_log_errors();
+        L_ERROR("TLS write error");
+        return;
+    }
+}
+
+// TODO: client could possibly swap to another account's email & token?
+static cJSON *save_pwmngr_file(char *email, uint8_t *token, uint16_t data_len, uint8_t *fdata, ThreadData *tdata) {
+
+    cJSON *token_check = check_raw_token(email, token);
+    if (token_check)
+        return token_check;
+
+    if (data_len == 0) { // done; write to file
+
+        tdata->ed = D_NONE;
+
+        if (tdata->file_recv_len < sizeof(VaultHeader))
+            return server_error(E_BADVAULT, "Received data length is less than sizeof(VaultHeader)");
+
+        VaultHeader *hdr = (VaultHeader *)tdata->file_recv_buf;
+
+        if (memcmp(hdr->magic, VAULT_MAGIC, 6)) {
+            free(tdata->file_recv_buf);
+            tdata->file_recv_buf = NULL;
+            tdata->file_recv_len = 0;
+            return server_error(E_BADVAULT, "Invalid vault magic!");
+        }
+
+        if (hdr->version != VAULT_VERSION) {
+            free(tdata->file_recv_buf);
+            tdata->file_recv_buf = NULL;
+            tdata->file_recv_len = 0;
+            return server_error(E_BADVAULT, "Invalid vault version!");
+        }
+
+        uint8_t *hash = sha_256_hash((uint8_t *)hdr + 10 + HASH_LEN, tdata->file_recv_len - 10 - HASH_LEN);
+        if (!hash) {
+            free(tdata->file_recv_buf);
+            tdata->file_recv_buf = NULL;
+            tdata->file_recv_len = 0;
+
+            return server_error(E_INTERNALERR, "Failed to hash vault data!");
+        }
+
+        if (memcmp(hash, hdr->hash, HASH_LEN)) {
+            free(hash);
+            free(tdata->file_recv_buf);
+            tdata->file_recv_buf = NULL;
+            tdata->file_recv_len = 0;
+
+            return server_error(E_BADVAULT, "Verification failed for vault: invalid hash!");
+        }
+
+        free(hash);
+
+        char *vault_path = ec_malloc(strlen(VAULTS_DIR) + HASH_LEN * 2 + strlen(".pwmngr") + 1);
+        char *email_hash = hash_email(email);
+        sprintf(vault_path, "%s%s.pwmngr", VAULTS_DIR, email_hash);
+        free(email_hash);
+        lock_file(vault_path);
+        FILE *fp = fopen(vault_path, "wb");
+        if (!fp) {
+            unlock_file(vault_path);
+            free(vault_path);
+            if (tdata->file_recv_buf) {
+                free(tdata->file_recv_buf);
+                tdata->file_recv_buf = NULL;
+            }
+            tdata->file_recv_len = 0;
+            return server_error(E_INTERNALERR, "Failed to open/create user vault!");
+        }
+
+        size_t written = 0;
+
+        while (written < tdata->file_recv_len) {
+            size_t n = fwrite(tdata->file_recv_buf + written, 1, tdata->file_recv_len - written, fp);
+            if (n == 0) {
+                unlock_file(vault_path);
+                free(vault_path);
+                if (tdata->file_recv_buf) {
+                    free(tdata->file_recv_buf);
+                    tdata->file_recv_buf = NULL;
+                }
+                tdata->file_recv_len = 0;
+                fclose(fp);
+                L_ERROR("Failed to write data to vault file!");
+                return server_error(E_INTERNALERR, "Failed to write to vault file!");
+            }
+            written += n;
+        }
+
+        fclose(fp);
+        unlock_file(vault_path);
+        free(vault_path);
+
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+        cJSON_AddNumberToObject(response, "bytes_written", written);
+        return response;
+    }
+
+    if (!tdata->file_recv_buf)
+        tdata->file_recv_buf = ec_malloc(data_len);
+    else
+        tdata->file_recv_buf = ec_realloc(tdata->file_recv_buf, tdata->file_recv_len + data_len);
+
+    memcpy(tdata->file_recv_buf, fdata, data_len);
+    tdata->file_recv_len += data_len;
+
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "code", DATA_WAIT);
+    return response;
+}
+
+static int handle_request(char *request, int request_len, char *response_buf, size_t response_buf_len,
+                          ThreadData *tdata) {
 
     if (!strcmp(request, "GETSERVERINFO")) {
 
         char server_info[768];
 
 #ifdef NO_DETAILED_SERVER_INFO
-        strncpy(server_info, SERVER_INFO, sizeof(server_info));
+        strncpy(server_info, SERVER_INFO, sizeof(server_info) - 1);
 #else
         struct utsname info;
         uname(&info);
 
         char cpu_model[256] = {0};
 
+        lock_file("/proc/cpuinfo");
         FILE *fp = fopen("/proc/cpuinfo", "r");
 
         if (fp) {
@@ -1035,6 +2263,8 @@ int handle_request(char *request, int request_len, char *response_buf, size_t re
             fclose(fp);
         }
 
+        unlock_file("/proc/cpuinfo");
+
         snprintf(server_info, sizeof(server_info), "%s\n%s %s %s\n%s", SERVER_INFO, info.sysname, info.release,
                  info.machine, cpu_model);
 #endif
@@ -1042,12 +2272,13 @@ int handle_request(char *request, int request_len, char *response_buf, size_t re
         cJSON *root = cJSON_CreateObject();
         cJSON_AddNumberToObject(root, "code", 0);
         cJSON_AddNumberToObject(root, "server_version", SERVER_VERSION);
-        cJSON_AddStringToObject(root, "response", server_info);
+        cJSON_AddBoolToObject(root, "smtp_enabled", smtp_enabled());
+        cJSON_AddStringToObject(root, "info", server_info);
 
         char *response = cJSON_PrintUnformatted(root);
         cJSON_Delete(root);
 
-        strncpy(response_buf, response, response_buf_len);
+        strncpy(response_buf, response, response_buf_len - 1);
         free(response);
         return strlen(response_buf);
     }
@@ -1070,7 +2301,7 @@ int handle_request(char *request, int request_len, char *response_buf, size_t re
 
         if (RESPONSE_EQ("CREATEACCOUNT")) {
 
-            response_j = run_create_account(root, expected_data);
+            response_j = run_create_account(root, tdata);
 
             cJSON_Delete(root);
             goto send_response;
@@ -1078,7 +2309,64 @@ int handle_request(char *request, int request_len, char *response_buf, size_t re
 
         if (RESPONSE_EQ("UPDATEACCOUNT")) {
 
-            response_j = run_update_account(root);
+            response_j = run_update_account(root, tdata);
+
+            cJSON_Delete(root);
+            goto send_response;
+        }
+
+        if (RESPONSE_EQ("DELETEACCOUNT")) {
+
+            response_j = run_delete_account(root);
+
+            cJSON_Delete(root);
+            goto send_response;
+        }
+
+        if (RESPONSE_EQ("IMPORTACCOUNT")) {
+
+            response_j = run_import_account(root);
+
+            cJSON_Delete(root);
+            goto send_response;
+        }
+
+        if (RESPONSE_EQ("AUTH")) {
+
+            response_j = run_auth(root, tdata);
+
+            cJSON_Delete(root);
+            goto send_response;
+        }
+
+        if (RESPONSE_EQ("INVALIDATETOKENS")) {
+
+            response_j = run_invalidate_tokens(root);
+
+            cJSON_Delete(root);
+            goto send_response;
+        }
+
+        if (RESPONSE_EQ("GETACCOUNTINFO")) {
+
+            response_j = run_get_account_info(root);
+
+            cJSON_Delete(root);
+            goto send_response;
+        }
+
+        if (RESPONSE_EQ("GETVAULT")) {
+
+            response_j =
+                run_get_vault(root, tdata, (void (*)(SSL *, const uint8_t *, const uint16_t))send_pwmngr_file_packet);
+
+            cJSON_Delete(root);
+            goto send_response;
+        }
+
+        if (RESPONSE_EQ("PUSHVAULT")) {
+
+            response_j = run_push_vault(root, tdata);
 
             cJSON_Delete(root);
             goto send_response;
@@ -1093,47 +2381,153 @@ int handle_request(char *request, int request_len, char *response_buf, size_t re
 
     if (!strncmp(request, "DATA", strlen("DATA"))) { // data exchange
 
-        switch (*expected_data) {
+        switch (tdata->ed) {
         case D_NONE:
             break;
 
-        case D_CREATEACC_VERIFICATION_CODE:
+        case D_CA_EMAIL_VERIFICATION_CODE:
             if (request_len < 11) {
-                response_j = cJSON_CreateObject();
-                cJSON_AddNumberToObject(response_j, "code", E_INVALIDDATA);
-                cJSON_AddStringToObject(
-                    response_j, "err",
+                response_j = server_error(
+                    E_INVALIDDATA,
                     "Invalid data length for verification code! (expected \"DATA\" + uint32_t + valid email)");
                 goto send_response;
             }
 
-            int32_t code  = *(int32_t *)(request + 4);
-            char   *email = ec_malloc(request_len - 7);
-            memcpy(email, (char *)(request + 8), request_len - 8);
-            email[request_len - 8] = 0;
+            int32_t ca_code = *(int32_t *)(request + 4);
 
-            if (code < 0 || code > 999999) {
-                free(email);
-                response_j = cJSON_CreateObject();
-                cJSON_AddNumberToObject(response_j, "code", E_INVALIDDATA);
-                cJSON_AddStringToObject(response_j, "err", "Invalid verification code! (expected 0 <= code <= 999999)");
+            char *ca_veri_email = ec_malloc(request_len - 7);
+            memcpy(ca_veri_email, (char *)(request + 8), request_len - 8);
+            ca_veri_email[request_len - 8] = 0;
+
+            if (ca_code < 0 || ca_code > 999999) {
+                free(ca_veri_email);
+                response_j = server_error(E_INVALIDDATA, "Invalid verification code! (expected 0 <= code <= 999999)");
                 goto send_response;
             }
 
             // NULL because new_acc is only passed when no verification is required
-            response_j = finish_create_account(email, code, NULL);
-            free(email);
+            response_j = finish_create_account(ca_veri_email, ca_code, NULL);
+            free(ca_veri_email);
+
+            goto send_response;
+
+        case D_UA_EMAIL_VERIFICATION_CODE:
+            if (request_len < 4 + TOKEN_LEN + (int)sizeof(uint32_t) + 3 * 2 + (int)sizeof(uint16_t) * 2) {
+                response_j =
+                    server_error(E_INVALIDDATA, "Invalid data length for verification code! (expected \"DATA\" + token "
+                                                "+ uint32_t + uint16_t + new email + uint16_t + old email)");
+                goto send_response;
+            }
+
+            int32_t ua_code = *(int32_t *)(request + 4 + TOKEN_LEN);
+
+            uint16_t ua_veri_email_len = *(uint16_t *)(request + 4 + TOKEN_LEN + sizeof(uint32_t));
+            if (request_len <
+                4 + TOKEN_LEN + (int)sizeof(uint32_t) + (int)sizeof(uint16_t) * 2 + ua_veri_email_len + 3) {
+                response_j = server_error(E_INVALIDDATA,
+                                          "Invalid data length for verification ua_code! (expected \"DATA\" + token "
+                                          "+ uint32_t + uint16_t + new email + uint16_t + old email)");
+                goto send_response;
+            }
+            char *ua_veri_email = ec_malloc(ua_veri_email_len + 1);
+            memcpy(ua_veri_email, (char *)(request + 4 + TOKEN_LEN + sizeof(uint32_t) + sizeof(uint16_t)),
+                   ua_veri_email_len);
+            ua_veri_email[ua_veri_email_len] = 0;
+
+            uint16_t ua_old_email_len =
+                *(uint16_t *)(request + 4 + TOKEN_LEN + sizeof(uint32_t) + sizeof(uint16_t) + ua_veri_email_len);
+            if (request_len < 4 + TOKEN_LEN + (int)sizeof(uint32_t) + (int)sizeof(uint16_t) * 2 + ua_veri_email_len +
+                                  ua_old_email_len) {
+                free(ua_veri_email);
+                response_j =
+                    server_error(E_INVALIDDATA, "Invalid data length for verification code! (expected \"DATA\" + token "
+                                                "+ uint32_t + uint16_t + new email + uint16_t + old email)");
+                goto send_response;
+            }
+            char *ua_old_email = ec_malloc(ua_old_email_len + 1);
+            memcpy(ua_old_email, (char *)(request + 4 + TOKEN_LEN + sizeof(uint32_t) + sizeof(uint16_t)),
+                   ua_old_email_len);
+            ua_old_email[ua_old_email_len] = 0;
+
+            if (ua_code < 0 || ua_code > 999999) {
+                free(ua_veri_email);
+                free(ua_old_email);
+                response_j = server_error(E_INVALIDDATA, "Invalid verification code! (expected 0 <= code <= 999999)");
+                goto send_response;
+            }
+
+            // NULL because new_acc is only passed when no verification is required
+            response_j = finish_update_account(ua_veri_email, ua_old_email, (uint8_t *)(request + 4), ua_code, NULL);
+            free(ua_veri_email);
+            free(ua_old_email);
+
+            goto send_response;
+
+        case D_CHALLENGE_RESPONSE:
+            if (request_len < (int)strlen("DATA") + (int)SIGNATURE_LEN + 3) {
+                response_j = server_error(
+                    E_INVALIDDATA, "Invalid response to challenge! (expected \"DATA\" + 64-byte signature + email)");
+                goto send_response;
+            }
+
+            char *c_res_email = ec_malloc(request_len - strlen("DATA") - SIGNATURE_LEN + 1);
+            memcpy(c_res_email, (char *)(request + strlen("DATA") + SIGNATURE_LEN),
+                   request_len - strlen("DATA") - SIGNATURE_LEN);
+            c_res_email[request_len - strlen("DATA") - SIGNATURE_LEN] = 0;
+
+            uint32_t uid = get_uid(c_res_email);
+            if (!uid) {
+                free(c_res_email);
+                response_j = server_error(E_NOACCOUNT, "No account found for provided email!");
+                goto send_response;
+            }
+
+            response_j = finish_auth(uid, (uint8_t *)request + 4, tdata);
+            free(c_res_email);
 
             goto send_response;
 
         case D_PWMNGR_FILE_TRANSFER:
-            //
-            // goto send_data_response;
+
+            if (request_len < (int)strlen("DATA") + TOKEN_LEN + (int)sizeof(uint16_t) + 3 + (int)sizeof(uint16_t)) {
+                response_j = server_error(
+                    E_INVALIDDATA,
+                    "Invalid pwmngr file data! (expected \"DATA\" + token + uint16_t + email + uint16_t + data)");
+                goto send_response;
+            }
+
+            uint16_t file_email_len = *(uint16_t *)(request + 4 + TOKEN_LEN);
+
+            if (request_len <
+                (int)strlen("DATA") + TOKEN_LEN + (int)sizeof(uint16_t) + file_email_len + (int)sizeof(uint16_t)) {
+                response_j = server_error(
+                    E_INVALIDDATA,
+                    "Invalid pwmngr file data! (expected \"DATA\" + token + uint16_t + email + uint16_t + fdata)");
+                goto send_response;
+            }
+            char *file_email = ec_malloc(file_email_len + 1);
+            memcpy(file_email, request + 4 + TOKEN_LEN + sizeof(uint16_t), file_email_len);
+            file_email[file_email_len] = 0;
+
+            uint16_t data_len = *(uint16_t *)(request + 4 + TOKEN_LEN + sizeof(uint16_t) + file_email_len);
+            if (request_len < (int)strlen("DATA") + TOKEN_LEN + (int)sizeof(uint16_t) + file_email_len +
+                                  (int)sizeof(uint16_t) + data_len) {
+                free(file_email);
+                response_j = server_error(
+                    E_INVALIDDATA,
+                    "Invalid pwmngr file data! (expected \"DATA\" + token + uint16_t + email + uint16_t + fdata)");
+                goto send_response;
+            }
+
+            response_j = save_pwmngr_file(
+                file_email, (uint8_t *)request + 4, data_len,
+                (uint8_t *)request + 4 + TOKEN_LEN + sizeof(uint16_t) + file_email_len + sizeof(uint16_t), tdata);
+            free(file_email);
+
+            goto send_response;
         }
 
-        response_j = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response_j, "code", 1);
-        cJSON_AddStringToObject(response_j, "err", "Received unexpected data!");
+        response_j = server_error(E_UNEXPECTEDDATA, "Received unexpected data!");
         goto send_response;
     }
 
@@ -1143,16 +2537,33 @@ send_response:
     char *response = cJSON_PrintUnformatted(response_j);
     cJSON_Delete(response_j);
 
-    strncpy(response_buf, response, response_buf_len);
+    strncpy(response_buf, response, response_buf_len - 1);
     free(response);
     return strlen(response_buf);
 }
 
-void handle_client_tls(SSL *ssl, char *ip) {
-    char buf[4200];
+// TODO: Possible ddos point (client can open connection and never send anything)
+static void handle_client_tls(SSL *ssl, char *ip) {
+    char buf[4500];
     int  n;
 
-    ExpectedData expected_data = D_NONE;
+    // per-connection state
+    ThreadData tdata = {D_NONE, {0}, ip, ssl, 0, 0};
+
+    if (ip && ip[0] && num_outstanding_codes) {
+
+        pthread_mutex_lock(&verification_codes_lock);
+
+        // persistent codes over multiple connections
+        for (int i = 0; i < num_outstanding_codes; i++) {
+            if (!strcmp(verification_codes[i].request_ip_src, ip)) {
+                tdata.ed = verification_codes[i].type;
+                break;
+            }
+        }
+
+        pthread_mutex_unlock(&verification_codes_lock);
+    }
 
     for (;;) {
         n = SSL_read(ssl, buf, sizeof(buf));
@@ -1195,12 +2606,12 @@ void handle_client_tls(SSL *ssl, char *ip) {
         }
 
         char response[2048];
-        int  rlen = handle_request(buf, n, response, sizeof(response), &expected_data);
+        int  rlen = handle_request(buf, n, response, sizeof(response), &tdata);
 
         if (rlen == -1) {
             char tmp_res[50];
             snprintf(tmp_res, sizeof(tmp_res), "{\"code\":%d,\"err\":\"Bad request\"}", E_BADREQ);
-            strncpy(response, tmp_res, sizeof(response));
+            strncpy(response, tmp_res, sizeof(response) - 1);
             rlen = strlen(response);
         }
 
@@ -1234,7 +2645,7 @@ int q_head = 0, q_tail = 0;
 pthread_mutex_t q_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  q_cond  = PTHREAD_COND_INITIALIZER;
 
-void *tls_consumer(void *arg) {
+static void *tls_consumer(void *arg) {
     (void)(arg);
 
     while (1) {
@@ -1275,9 +2686,11 @@ void *tls_consumer(void *arg) {
         SSL_free(ssl);
         close(fd);
     }
+
+    return NULL;
 }
 
-int save_server_data() {
+static int save_server_data() {
     int err = 0;
     if (save_accounts())
         err |= 1;
@@ -1292,7 +2705,7 @@ int save_server_data() {
 #define SAVE_INTERVAL_MINUTES 5
 #endif
 
-void *save_thread(void *arg) {
+static void *save_thread(void *arg) {
     (void)arg;
     while (1) {
         sleep(SAVE_INTERVAL_MINUTES * 60);
@@ -1303,6 +2716,14 @@ void *save_thread(void *arg) {
         else
             L_DEBUG("Successfully saved data to persistent storage");
     }
+    return NULL;
+}
+
+volatile sig_atomic_t server_stop = 0;
+
+static void on_shutdown(int sig) {
+    (void)sig;
+    server_stop = 1;
 }
 
 int main() {
@@ -1314,6 +2735,7 @@ int main() {
 
     // accounts.bin
 
+    // no locking necessary until other threads are alive
     FILE *accounts_fp = fopen(ACCOUNTS_FILE, "rb");
     if (!accounts_fp) {
         L_ERROR("Failed to open accounts file! (trying to create it)");
@@ -1409,7 +2831,7 @@ int main() {
             bytes_read += sizeof(uint16_t);
 
             if (remaining_size - bytes_read < accounts[j].email_len) {
-                L_FATAL("Invalid email structure in accounts_buf! (not enough space for struct UserEmail)");
+                L_FATAL("Invalid email structure in accounts_buf! (not enough space for email)");
                 free_accounts();
                 return 2;
             }
@@ -1542,6 +2964,10 @@ int main() {
         return 6;
     }
 
+    struct sigaction sa = {0};
+    sa.sa_handler       = on_shutdown;
+    sigaction(SIGTERM, &sa, NULL);
+
     for (int i = 0; i < NUM_THREADS; i++) {
         pthread_t tid;
         pthread_create(&tid, NULL, tls_consumer, NULL);
@@ -1591,7 +3017,7 @@ int main() {
 
     plog(PLOG_INFO, "Listening on port %d\n", PORT);
 
-    while (1) {
+    while (!server_stop) {
         client_fd = accept(server_fd, (struct sockaddr *)&addr, &addrlen);
         if (client_fd < 0) {
             L_ERROR("Failed to accept connection");
@@ -1624,6 +3050,9 @@ int main() {
 
     close(server_fd);
     free_accounts();
-    free(tokens);
+    if (tokens)
+        free(tokens);
+    if (verification_codes)
+        free(verification_codes);
     return 0;
 }

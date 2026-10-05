@@ -20,6 +20,15 @@ View logs: `sudo journalctl -u passwdmngrd -f`
 
 - Note: This server is currently configured to run as root; however, I will look into making it non-privileged once I finish the basic structure
 
+### Hosting
+
+You will need a way to expose this server to the internet for clients to connect to.
+Recommended hosting solution:
+- Run server on Raspberry Pi or other dedicated hardware
+- Setup VPS service like Hostinger, running a minimal linux system
+- Create ssh tunnel between local server and VPS; run as a systemd service
+- Clients connect to VPS ip & VPS forwards raw TCP to local server 
+
 ## SMTP Verification
 
 This server stores user data by email & user id; however, SMTP verification via six-digit codes sent to the provided email address is disabled by default. To configure SMTP verification, enter your credentials in `/var/lib/passwdmngrd/smtp.conf` and change use_smtp_verification to true. If smtp is not configured properly and libcurl cannot send the email, the server will return an error on every CREATEACCOUNT request.

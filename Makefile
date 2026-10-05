@@ -5,7 +5,6 @@ CFLAGS += $(shell pkg-config --cflags libcurl)
 
 LDLIBS := -L./lib -lsodium -lcrypto -lssl -lcurl -lvldmail
 
-
 SERVER_SRCS := $(wildcard src/*.c)
 SERVER_SRCS := $(filter-out src/client.c, $(SERVER_SRCS))
 SERVER_OBJS := $(SERVER_SRCS:src/%.c=build/%.o)
