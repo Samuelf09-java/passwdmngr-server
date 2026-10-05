@@ -1,10 +1,10 @@
 [Unit]
-Description=Password Manager Server (testing)
+Description=Password Manager Server
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/valgrind --leak-check=full --track-origins=yes /usr/local/bin/passwdmngrd
+ExecStart=/usr/local/bin/passwdmngrd
 Restart=on-failure
 User=root
 WorkingDirectory=/usr/local/bin
