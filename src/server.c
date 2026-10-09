@@ -258,8 +258,9 @@ typedef struct __attribute__((packed)) ServerAccount {
     uint8_t  uname_hash[UNAME_HASH_LEN];
     uint8_t  passwd_hash[PASSWD_HASH_LEN];
     uint8_t  auth_pk[AUTH_PK_LEN];
-    uint8_t  salt[SALT_LEN]; // stored here for syncing accounts
+    uint8_t  salt[SALT_LEN];
     uint64_t auth_seed_id;
+    int64_t  last_modified;
     uint16_t email_len;
     char    *email;
 } ServerAccount;
@@ -276,22 +277,6 @@ typedef struct __attribute__((packed)) AuthToken {
     uint64_t expire_time;
     uint32_t user_id;
 } AuthToken;
-
-#define NONCE_LEN 12
-#define TAG_LEN 16
-
-// copied from client-side; only magic, version, hash, and timestamp are really used
-typedef struct __attribute__((packed)) VaultHeader {
-    char     magic[6];
-    uint32_t version;
-    uint8_t  hash[HASH_LEN];
-    uint64_t timestamp;
-    uint32_t num_entries;
-    uint32_t ciphertext_len;
-    uint8_t  salt[SALT_LEN];
-    uint8_t  nonce[NONCE_LEN];
-    uint8_t  tag[TAG_LEN];
-} VaultHeader;
 
 typedef struct SmtpConfig {
     int   use_smtp_verification;
@@ -609,15 +594,12 @@ static cJSON *check_raw_token(char *email, uint8_t *token) {
 
     if (!error) {
         pthread_mutex_unlock(&tokens_lock);
-        free(token);
         return server_error(E_INVALIDTOKEN, "Token incorrect/not found for provided id");
     }
 
 found_valid_token:
 
     pthread_mutex_unlock(&tokens_lock);
-
-    free(token);
 
     if (error)
         return server_error(error, "Token expired");
@@ -828,12 +810,14 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
     int resend_ok = request_resend_obj && cJSON_IsBool(request_resend_obj);
     int data_ok = username_hash_obj && cJSON_IsString(username_hash_obj) && password_hash_obj &&
                   cJSON_IsString(password_hash_obj) && auth_pk_obj && cJSON_IsString(auth_pk_obj) && auth_seed_id_obj &&
-                  cJSON_IsNumber(auth_seed_id_obj) && salt_obj && cJSON_IsString(salt_obj);
+                  cJSON_IsString(auth_seed_id_obj) && strlen(auth_seed_id_obj->valuestring) == 16 && salt_obj &&
+                  cJSON_IsString(salt_obj);
 
     if (!email_ok || !(resend_ok ^ data_ok)) {
         return server_error(
-            E_BADREQ, "Missing/malformed fields in request! (expected email (str) & (request_resend "
-                      "(bool) ^ username_hash (str), password_hash (str), auth_pk (str), and auth_seed_id (uint64_t))");
+            E_BADREQ,
+            "Missing/malformed fields in request! (expected email (str) & (request_resend "
+            "(bool) ^ username_hash (str), password_hash (str), auth_pk (str), and auth_seed_id (16 hex bytes))");
     }
 
     char *email = cJSON_GetStringValue(email_obj);
@@ -851,17 +835,7 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
         goto resend_email;
     }
 
-    if (auth_seed_id_obj) {
-        char *auth_seed_id_str = auth_seed_id_obj->valuestring;
-
-        uint8_t buf[8];
-        for (int i = 0; i < 8; i++)
-            sscanf(auth_seed_id_str + 2 * i, "%2hhx", &buf[i]);
-
-        auth_seed_id = ((uint64_t)buf[0] << 56) | ((uint64_t)buf[1] << 48) | ((uint64_t)buf[2] << 40) |
-                       ((uint64_t)buf[3] << 32) | ((uint64_t)buf[4] << 24) | ((uint64_t)buf[5] << 16) |
-                       ((uint64_t)buf[6] << 8) | ((uint64_t)buf[7]);
-    }
+    auth_seed_id = hex_to_u64(auth_seed_id_obj->valuestring);
 
     int uname_hash_len;
     int passwd_hash_len;
@@ -1015,9 +989,10 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
             memcpy(verification_codes[code_idx].new_acc->passwd_hash, password_hash, PASSWD_HASH_LEN);
             memcpy(verification_codes[code_idx].new_acc->auth_pk, auth_pk, AUTH_PK_LEN);
             memcpy(verification_codes[code_idx].new_acc->salt, salt, SALT_LEN);
-            verification_codes[code_idx].new_acc->auth_seed_id = auth_seed_id;
-            verification_codes[code_idx].new_acc->email_len    = strlen(email);
-            verification_codes[code_idx].new_acc->email        = strdup(email);
+            verification_codes[code_idx].new_acc->auth_seed_id  = auth_seed_id;
+            verification_codes[code_idx].new_acc->last_modified = time(NULL);
+            verification_codes[code_idx].new_acc->email_len     = strlen(email);
+            verification_codes[code_idx].new_acc->email         = strdup(email);
 
             free(username_hash);
             free(password_hash);
@@ -1068,9 +1043,10 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
         memcpy(new_acc->passwd_hash, password_hash, PASSWD_HASH_LEN);
         memcpy(new_acc->auth_pk, auth_pk, AUTH_PK_LEN);
         memcpy(new_acc->salt, salt, SALT_LEN);
-        new_acc->auth_seed_id = auth_seed_id;
-        new_acc->email_len    = strlen(email);
-        new_acc->email        = strdup(email);
+        new_acc->last_modified = time(NULL);
+        new_acc->auth_seed_id  = auth_seed_id;
+        new_acc->email_len     = strlen(email);
+        new_acc->email         = strdup(email);
 
         free(username_hash);
         free(password_hash);
@@ -1150,15 +1126,21 @@ static cJSON *finish_create_account(char *email, int code, ServerAccount *new_ac
     pthread_mutex_unlock(&accounts_lock);
 
     char *token_b64 = assign_token(new_acc->user_id);
-    free(new_acc);
 
-    if (!token_b64)
+    if (!token_b64) {
+        free(new_acc);
         return server_error(E_INTERNALERR, "Failed to generate token/encode it as base64! Your account has been "
                                            "successfully created, but no token could be returned.");
+    }
+
+    char timestamp_str[17];
+    u64_to_hex(new_acc->last_modified, timestamp_str, sizeof(timestamp_str));
+    free(new_acc);
 
     cJSON *response = cJSON_CreateObject();
     cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
     cJSON_AddStringToObject(response, "token", token_b64);
+    cJSON_AddStringToObject(response, "last_modified", timestamp_str); // tell client what time to expect
     free(token_b64);
     return response;
 }
@@ -1189,6 +1171,9 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
     if (request_resend_obj && !cJSON_IsBool(request_resend_obj))
         return server_error(E_BADREQ, "Invalid data type for request_resend! (expected bool)");
 
+    if (request_resend_obj && !smtp_enabled())
+        return server_error(E_BADREQ, "SMTP verification not enabled!");
+
     if (request_resend_obj && has_update_data)
         return server_error(E_BADREQ, "If request_resend is set, only email, token, and new_email should be sent!");
 
@@ -1203,7 +1188,7 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
     ServerAccount *new_acc = NULL; // declare here to fix warnings
 
     int resend = 0;
-    if (request_resend_obj->type == cJSON_True) {
+    if (request_resend_obj && request_resend_obj->type == cJSON_True) {
 
         if (!new_email)
             return server_error(E_BADREQ, "Missing field 'new_email'!");
@@ -1213,16 +1198,10 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
     }
 
     if (!new_auth_pk_obj || !cJSON_IsString(new_auth_pk_obj) || !new_auth_seed_id_obj ||
-        !cJSON_IsNumber(new_auth_seed_id_obj))
+        !cJSON_IsString(new_auth_seed_id_obj))
         return server_error(E_BADREQ, "You must update auth_pk on every account update");
 
-    uint8_t buf[8];
-    for (int i = 0; i < 8; i++)
-        sscanf(new_auth_seed_id_obj->valuestring + 2 * i, "%2hhx", &buf[i]);
-
-    uint64_t new_auth_seed_id = ((uint64_t)buf[0] << 56) | ((uint64_t)buf[1] << 48) | ((uint64_t)buf[2] << 40) |
-                                ((uint64_t)buf[3] << 32) | ((uint64_t)buf[4] << 24) | ((uint64_t)buf[5] << 16) |
-                                ((uint64_t)buf[6] << 8) | ((uint64_t)buf[7]);
+    uint64_t new_auth_seed_id = hex_to_u64(new_auth_seed_id_obj->valuestring);
     if (new_auth_seed_id < 2)
         return server_error(E_BADREQ, "Invalid auth_seed_id (must be > 1)");
 
@@ -1350,6 +1329,8 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
         memcpy(new_acc->salt, new_salt, SALT_LEN);
         free(new_salt);
     }
+
+    new_acc->last_modified = time(NULL);
 
     if (new_email && strcmp(new_email, new_acc->email)) {
 
@@ -1509,7 +1490,7 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
 
     } else {
 
-        int success = 0;
+        int64_t success = 0; // will hold last_modified on success
 
         pthread_mutex_lock(&accounts_lock);
 
@@ -1519,7 +1500,7 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
                 free(accounts[i].email);
                 accounts[i] = *new_acc;
                 free(new_acc);
-                success = 1;
+                success = accounts[i].last_modified;
             }
         }
 
@@ -1531,8 +1512,12 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
             return server_error(E_NOACCOUNT, "Failed to find account to update from uid! (changed by another thread)");
         }
 
+        char timestamp_str[17];
+        u64_to_hex(success, timestamp_str, sizeof(timestamp_str));
+
         cJSON *response = cJSON_CreateObject();
         cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+        cJSON_AddStringToObject(response, "last_modified", timestamp_str);
         return response;
     }
 }
@@ -1601,7 +1586,7 @@ static cJSON *finish_update_account(char *email, char *old_email, uint8_t *token
         return server_error(E_NOACCOUNT, "Failed to fetch uid from old email!");
     }
 
-    int success = 0;
+    int64_t success = 0;
 
     pthread_mutex_lock(&accounts_lock);
 
@@ -1611,7 +1596,7 @@ static cJSON *finish_update_account(char *email, char *old_email, uint8_t *token
             free(accounts[i].email);
             accounts[i] = *new_acc;
             free(new_acc);
-            success = 1;
+            success = accounts[i].last_modified;
         }
     }
 
@@ -1623,8 +1608,61 @@ static cJSON *finish_update_account(char *email, char *old_email, uint8_t *token
         return server_error(E_INTERNALERR, "Failed to find account to update from uid! (changed by another thread)");
     }
 
+    // rename vault
+
+    char *old_vault_path = ec_malloc(strlen(VAULTS_DIR) + HASH_LEN * 2 + strlen(".pwmngr") + 1);
+    char *new_vault_path = ec_malloc(strlen(VAULTS_DIR) + HASH_LEN * 2 + strlen(".pwmngr") + 1);
+    char *old_email_hash = hash_email(old_email);
+    char *new_email_hash = hash_email(email);
+    sprintf(old_vault_path, "%s%s.pwmngr", VAULTS_DIR, old_email_hash);
+    sprintf(new_vault_path, "%s%s.pwmngr", VAULTS_DIR, new_email_hash);
+    free(old_email_hash);
+    free(new_email_hash);
+
+    lock_file(old_vault_path);
+    lock_file(new_vault_path);
+
+    FILE *fp = fopen(new_vault_path, "rb");
+    if (fp) {
+        fclose(fp);
+        unlock_file(old_vault_path);
+        unlock_file(new_vault_path);
+        free(old_vault_path);
+        free(new_vault_path);
+        L_ERROR("New vault path already exists! (bug/thread issue)");
+        return server_error(E_INTERNALERR, "Failed to rename user vault! (new vault already exists)");
+    }
+
+    fp = fopen(old_vault_path, "rb");
+    if (fp) {
+
+        fclose(fp);
+        unlock_file(old_vault_path);
+        unlock_file(new_vault_path);
+
+        if (rename(old_vault_path, new_vault_path)) {
+            free(old_vault_path);
+            free(new_vault_path);
+            L_ERROR("Failed to rename vault!");
+            return server_error(E_INTERNALERR, "Failed to rename user vault!");
+        }
+
+        free(old_vault_path);
+        free(new_vault_path);
+
+    } else { // vault not created yet; do nothing
+        unlock_file(old_vault_path);
+        unlock_file(new_vault_path);
+        free(old_vault_path);
+        free(new_vault_path);
+    }
+
+    char timestamp_str[17];
+    u64_to_hex(success, timestamp_str, sizeof(timestamp_str));
+
     cJSON *response = cJSON_CreateObject();
     cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
+    cJSON_AddStringToObject(response, "last_modified", timestamp_str);
     return response;
 }
 
@@ -1678,6 +1716,13 @@ static cJSON *run_import_account(cJSON *request) {
     if (token_check)
         return token_check;
 
+    cJSON *last_known_timestamp_obj = cJSON_GetObjectItem(request, "last_known_timestamp");
+    if (!last_known_timestamp_obj || !cJSON_IsString(last_known_timestamp_obj) ||
+        strlen(last_known_timestamp_obj->valuestring) != 16)
+        return server_error(E_BADREQ, "Missing/invalid field 'last_known_timestamp'!");
+
+    time_t client_timestamp = (time_t)hex_to_u64(last_known_timestamp_obj->valuestring);
+
     uint32_t uid = get_uid(cJSON_GetObjectItem(request, "email")->valuestring);
 
     ServerAccount *acc = ec_calloc(1, sizeof(ServerAccount));
@@ -1698,10 +1743,18 @@ static cJSON *run_import_account(cJSON *request) {
         return server_error(E_NOACCOUNT, "No account found for provided email!");
     }
 
+    if (acc->last_modified == client_timestamp) {
+        free(acc);
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddNumberToObject(response, "code", E_CLIENTUPTODATE);
+        return response;
+    }
+
     char *uname_hash_b64  = b64_encode(acc->uname_hash, UNAME_HASH_LEN);
     char *passwd_hash_b64 = b64_encode(acc->passwd_hash, PASSWD_HASH_LEN);
     char *auth_pk_b64     = b64_encode(acc->auth_pk, AUTH_PK_LEN);
-    if (!uname_hash_b64 || !passwd_hash_b64 || !auth_pk_b64) {
+    char *salt_b64        = b64_encode(acc->salt, SALT_LEN);
+    if (!uname_hash_b64 || !passwd_hash_b64 || !auth_pk_b64 || !salt_b64) {
         free(acc);
         if (uname_hash_b64)
             free(uname_hash_b64);
@@ -1709,15 +1762,17 @@ static cJSON *run_import_account(cJSON *request) {
             free(passwd_hash_b64);
         if (auth_pk_b64)
             free(auth_pk_b64);
+        if (salt_b64)
+            free(salt_b64);
 
         return server_error(E_INTERNALERR, "Failed to encode one or more fields as base64! (OOM/bad data)");
     }
 
-    char auth_seed_id_str[25];
+    char auth_seed_id_str[17];
+    char last_modified_str[17];
 
-    for (int i = 0; i / 2 < (int)sizeof(uint64_t); i += 2)
-        snprintf(auth_seed_id_str + i, sizeof(auth_seed_id_str) - i, "%02x",
-                 *(uint8_t *)(((uint8_t *)&acc->auth_seed_id) + i));
+    u64_to_hex(acc->auth_seed_id, auth_seed_id_str, sizeof(auth_seed_id_str));
+    u64_to_hex(acc->last_modified, last_modified_str, sizeof(last_modified_str));
 
     cJSON *response = cJSON_CreateObject();
     cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
@@ -1725,6 +1780,9 @@ static cJSON *run_import_account(cJSON *request) {
     cJSON_AddStringToObject(response, "passwd_hash", passwd_hash_b64);
     cJSON_AddStringToObject(response, "auth_pk", auth_pk_b64);
     cJSON_AddStringToObject(response, "auth_seed_id", auth_seed_id_str);
+    cJSON_AddStringToObject(response, "salt", salt_b64);
+    cJSON_AddStringToObject(response, "last_modified", last_modified_str);
+    free(acc);
     return response;
 }
 
@@ -1834,18 +1892,29 @@ static cJSON *run_get_account_info(cJSON *request) {
     if (!email_obj || !cJSON_IsString(email_obj))
         return server_error(E_BADREQ, "Missing/invalid field 'email'! (expected string)");
 
+    // can be set to 0 if the client is requesting this for the first time;
+    // it's just meant to reduce client-side work where possible (same with IMPORTACCOUNT)
+    cJSON *last_known_timestamp_obj = cJSON_GetObjectItem(request, "last_known_timestamp");
+    if (!last_known_timestamp_obj || !cJSON_IsString(last_known_timestamp_obj) ||
+        strlen(last_known_timestamp_obj->valuestring) != 16)
+        return server_error(E_BADREQ, "Missing/invalid field 'last_known_timestamp'!");
+
+    time_t client_timestamp = (time_t)hex_to_u64(last_known_timestamp_obj->valuestring);
+
     uint32_t uid = get_uid(email_obj->valuestring);
     if (!uid)
         return server_error(E_NOACCOUNT, "No account found for provided email!");
 
-    uint64_t auth_seed_id = 0;
+    int64_t  last_modified = 0;
+    uint64_t auth_seed_id  = 0;
     uint8_t  salt[SALT_LEN];
 
     pthread_mutex_lock(&accounts_lock);
 
     for (int i = 0; i < num_accounts; i++) {
         if (accounts[i].user_id == uid) {
-            auth_seed_id = accounts[i].auth_seed_id;
+            last_modified = accounts[i].last_modified;
+            auth_seed_id  = accounts[i].auth_seed_id;
             memcpy(salt, accounts[i].salt, SALT_LEN);
             break;
         }
@@ -1853,30 +1922,34 @@ static cJSON *run_get_account_info(cJSON *request) {
 
     pthread_mutex_unlock(&accounts_lock);
 
-    if (!auth_seed_id)
+    if (!last_modified)
         return server_error(E_NOACCOUNT, "Failed to find account from uid! (modified by another thread)");
+
+    if (last_modified == client_timestamp) {
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddNumberToObject(response, "code", E_CLIENTUPTODATE);
+        return response;
+    }
 
     char *salt_b64 = b64_encode(salt, SALT_LEN);
     if (!salt_b64)
         return server_error(E_INTERNALERR, "Failed to encode salt as base64! (OOM)");
 
     // hex string because cJSON doesn't support uint64_t
-    char auth_seed_id_str[25];
+    char auth_seed_id_str[17];
+    char last_modified_str[17];
 
-    for (int i = 0; i / 2 < (int)sizeof(uint64_t); i += 2)
-        snprintf(auth_seed_id_str + i, sizeof(auth_seed_id_str) - i, "%02x",
-                 *(uint8_t *)(((uint8_t *)&auth_seed_id) + i));
+    u64_to_hex(auth_seed_id, auth_seed_id_str, sizeof(auth_seed_id_str));
+    u64_to_hex(last_modified, last_modified_str, sizeof(last_modified_str));
 
     cJSON *response = cJSON_CreateObject();
     cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
     cJSON_AddStringToObject(response, "auth_seed_id", auth_seed_id_str);
     cJSON_AddStringToObject(response, "salt", salt_b64);
+    cJSON_AddStringToObject(response, "last_modified", last_modified_str);
+    free(salt_b64);
     return response;
 }
-
-// expected vault type
-#define VAULT_MAGIC "PWMNGR"
-#define VAULT_VERSION 2
 
 static cJSON *run_get_vault(cJSON *request, ThreadData *tdata,
                             void(send_packet)(SSL *ssl, const uint8_t *data, const uint16_t data_len)) {
@@ -1900,13 +1973,7 @@ static cJSON *run_get_vault(cJSON *request, ThreadData *tdata,
     if (strlen(client_timestamp_str) != 16)
         return server_error(E_BADREQ, "Invalid timestamp string!");
 
-    uint8_t tm_buf[8];
-    for (int i = 0; i < 8; i++)
-        sscanf(client_timestamp_str + 2 * i, "%2hhx", &tm_buf[i]);
-
-    time_t client_timestamp = ((time_t)tm_buf[0] << 56) | ((time_t)tm_buf[1] << 48) | ((time_t)tm_buf[2] << 40) |
-                              ((time_t)tm_buf[3] << 32) | ((time_t)tm_buf[4] << 24) | ((time_t)tm_buf[5] << 16) |
-                              ((time_t)tm_buf[6] << 8) | ((time_t)tm_buf[7]);
+    time_t client_timestamp = (time_t)hex_to_u64(client_timestamp_str);
 
     if (client_timestamp > time(NULL))
         return server_error(E_BADREQ, "Invalid timestamp! (time in the future)");
@@ -1945,7 +2012,7 @@ static cJSON *run_get_vault(cJSON *request, ThreadData *tdata,
     fread((uint8_t *)hdr, 1, fsize, fp); // read the whole file first, to verify hash
     fseek(fp, 0, SEEK_SET);
 
-    if (memcmp(hdr->magic, VAULT_MAGIC, 6)) {
+    if (memcmp(hdr->magic, V_MAGIC, 6)) {
         fclose(fp);
         unlock_file(vault_path);
         free(vault_path);
@@ -1954,7 +2021,7 @@ static cJSON *run_get_vault(cJSON *request, ThreadData *tdata,
         return server_error(E_BADVAULT, "Invalid vault magic!");
     }
 
-    if (hdr->version != VAULT_VERSION) {
+    if (hdr->version != V_VERSION) {
         fclose(fp);
         unlock_file(vault_path);
         free(vault_path);
@@ -2008,17 +2075,15 @@ static cJSON *run_get_vault(cJSON *request, ThreadData *tdata,
 
     free(hdr);
 
-// max bytes to send in a packet
-#define CHUNK_SIZE 4096
     while (remaining_bytes > 0) {
 
-        uint16_t sent_bytes = MIN(remaining_bytes, CHUNK_SIZE);
-        uint8_t  buf[CHUNK_SIZE + 4 + sizeof(uint16_t)];
+        uint16_t sent_bytes = MIN(remaining_bytes, VAULT_CHUNK_SIZE);
+        uint8_t  buf[VAULT_CHUNK_SIZE + 4 + sizeof(uint16_t)];
         memcpy(buf, "DATA", 4);
         memcpy(buf + 4, (uint8_t *)&sent_bytes, sizeof(uint16_t));
         fread(buf + 4 + sizeof(uint16_t), 1, sent_bytes, fp);
 
-        send_packet(tdata->ssl, buf, sent_bytes);
+        send_packet(tdata->ssl, buf, sent_bytes + 6);
 
         remaining_bytes -= sent_bytes;
     }
@@ -2047,13 +2112,7 @@ static cJSON *run_push_vault(cJSON *request, ThreadData *tdata) {
     if (strlen(timestamp_obj->valuestring) != 16)
         return server_error(E_BADREQ, "Invalid timestamp string!");
 
-    uint8_t tm_buf[8];
-    for (int i = 0; i < 8; i++)
-        sscanf(timestamp_obj->valuestring + 2 * i, "%2hhx", &tm_buf[i]);
-
-    time_t client_timestamp = ((time_t)tm_buf[0] << 56) | ((time_t)tm_buf[1] << 48) | ((time_t)tm_buf[2] << 40) |
-                              ((time_t)tm_buf[3] << 32) | ((time_t)tm_buf[4] << 24) | ((time_t)tm_buf[5] << 16) |
-                              ((time_t)tm_buf[6] << 8) | ((time_t)tm_buf[7]);
+    time_t client_timestamp = (time_t)hex_to_u64(timestamp_obj->valuestring);
 
     if (client_timestamp > time(NULL))
         return server_error(E_BADREQ, "Invalid timestamp! (time in the future)");
@@ -2088,7 +2147,7 @@ static cJSON *run_push_vault(cJSON *request, ThreadData *tdata) {
         VaultHeader *hdr = ec_calloc(1, sizeof(VaultHeader));
         fread(hdr, 1, sizeof(VaultHeader), fp);
 
-        if ((time_t)hdr->timestamp > client_timestamp) {
+        if ((time_t)hdr->timestamp > client_timestamp) { // don't accept push if server has newer vault
             cJSON *response = cJSON_CreateObject();
             cJSON_AddNumberToObject(response, "code", E_VAULTUPTODATE);
             cJSON_AddBoolToObject(response, "server_has_newer_version", 1);
@@ -2113,7 +2172,7 @@ static cJSON *run_push_vault(cJSON *request, ThreadData *tdata) {
     return response;
 }
 
-void send_pwmngr_file_packet(SSL *ssl, uint8_t *data, uint16_t data_len) {
+void send_pwmngr_file_packet(SSL *ssl, const uint8_t *data, const uint16_t data_len) {
     if (SSL_write(ssl, data, data_len) <= 0) {
         openssl_log_errors();
         L_ERROR("TLS write error");
@@ -2137,14 +2196,14 @@ static cJSON *save_pwmngr_file(char *email, uint8_t *token, uint16_t data_len, u
 
         VaultHeader *hdr = (VaultHeader *)tdata->file_recv_buf;
 
-        if (memcmp(hdr->magic, VAULT_MAGIC, 6)) {
+        if (memcmp(hdr->magic, V_MAGIC, 6)) {
             free(tdata->file_recv_buf);
             tdata->file_recv_buf = NULL;
             tdata->file_recv_len = 0;
             return server_error(E_BADVAULT, "Invalid vault magic!");
         }
 
-        if (hdr->version != VAULT_VERSION) {
+        if (hdr->version != V_VERSION) {
             free(tdata->file_recv_buf);
             tdata->file_recv_buf = NULL;
             tdata->file_recv_len = 0;
@@ -2271,7 +2330,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
 
         cJSON *root = cJSON_CreateObject();
         cJSON_AddNumberToObject(root, "code", 0);
-        cJSON_AddNumberToObject(root, "server_version", SERVER_VERSION);
+        cJSON_AddStringToObject(root, "server_version", SERVER_VERSION);
         cJSON_AddBoolToObject(root, "smtp_enabled", smtp_enabled());
         cJSON_AddStringToObject(root, "info", server_info);
 
@@ -2297,9 +2356,9 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             return -1;
         }
 
-#define RESPONSE_EQ(name) !strcmp(request_name->valuestring, name)
+#define REQUEST_EQ(name) !strcmp(request_name->valuestring, name)
 
-        if (RESPONSE_EQ("CREATEACCOUNT")) {
+        if (REQUEST_EQ("CREATEACCOUNT")) {
 
             response_j = run_create_account(root, tdata);
 
@@ -2307,7 +2366,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             goto send_response;
         }
 
-        if (RESPONSE_EQ("UPDATEACCOUNT")) {
+        if (REQUEST_EQ("UPDATEACCOUNT")) {
 
             response_j = run_update_account(root, tdata);
 
@@ -2315,7 +2374,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             goto send_response;
         }
 
-        if (RESPONSE_EQ("DELETEACCOUNT")) {
+        if (REQUEST_EQ("DELETEACCOUNT")) {
 
             response_j = run_delete_account(root);
 
@@ -2323,7 +2382,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             goto send_response;
         }
 
-        if (RESPONSE_EQ("IMPORTACCOUNT")) {
+        if (REQUEST_EQ("IMPORTACCOUNT")) {
 
             response_j = run_import_account(root);
 
@@ -2331,7 +2390,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             goto send_response;
         }
 
-        if (RESPONSE_EQ("AUTH")) {
+        if (REQUEST_EQ("AUTH")) {
 
             response_j = run_auth(root, tdata);
 
@@ -2339,7 +2398,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             goto send_response;
         }
 
-        if (RESPONSE_EQ("INVALIDATETOKENS")) {
+        if (REQUEST_EQ("INVALIDATETOKENS")) {
 
             response_j = run_invalidate_tokens(root);
 
@@ -2347,7 +2406,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             goto send_response;
         }
 
-        if (RESPONSE_EQ("GETACCOUNTINFO")) {
+        if (REQUEST_EQ("GETACCOUNTINFO")) {
 
             response_j = run_get_account_info(root);
 
@@ -2355,16 +2414,15 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             goto send_response;
         }
 
-        if (RESPONSE_EQ("GETVAULT")) {
+        if (REQUEST_EQ("GETVAULT")) {
 
-            response_j =
-                run_get_vault(root, tdata, (void (*)(SSL *, const uint8_t *, const uint16_t))send_pwmngr_file_packet);
+            response_j = run_get_vault(root, tdata, send_pwmngr_file_packet);
 
             cJSON_Delete(root);
             goto send_response;
         }
 
-        if (RESPONSE_EQ("PUSHVAULT")) {
+        if (REQUEST_EQ("PUSHVAULT")) {
 
             response_j = run_push_vault(root, tdata);
 
@@ -2492,7 +2550,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             if (request_len < (int)strlen("DATA") + TOKEN_LEN + (int)sizeof(uint16_t) + 3 + (int)sizeof(uint16_t)) {
                 response_j = server_error(
                     E_INVALIDDATA,
-                    "Invalid pwmngr file data! (expected \"DATA\" + token + uint16_t + email + uint16_t + data)");
+                    "Invalid pwmngr file data! (expected \"DATA\" + token + uint16_t + email + uint16_t + fdata)");
                 goto send_response;
             }
 

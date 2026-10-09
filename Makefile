@@ -1,6 +1,6 @@
 CC ?= gcc
 
-CFLAGS = -Wall -Wextra -O2 -I./include -g
+CFLAGS = -Wall -Wextra -O2 -I./include
 CFLAGS += $(shell pkg-config --cflags libcurl)
 
 LDLIBS := -L./lib -lsodium -lcrypto -lssl -lcurl -lvldmail
