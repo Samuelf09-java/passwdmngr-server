@@ -1,6 +1,7 @@
 #ifndef _SERVER_H
 #define _SERVER_H
 
+#include <sodium.h>
 #include <stdint.h>
 
 // helpful info for client
@@ -18,22 +19,31 @@
 #define V_MAGIC "PWMNGR"
 #define V_VERSION 2
 
-#define V_HASH_LEN 32
-#define V_SALT_LEN 16
-#define V_NONCE_LEN 12
-#define V_TAG_LEN 16
+#define HASH_LEN crypto_hash_sha256_BYTES
+#define AES_KEY_LEN crypto_aead_aes256gcm_KEYBYTES
+#define NONCE_LEN crypto_aead_aes256gcm_NPUBBYTES
+#define TAG_LEN crypto_aead_aes256gcm_ABYTES
+#define SALT_LEN crypto_pwhash_SALTBYTES
+#define UNAME_HASH_LEN HASH_LEN
+#define PASSWD_HASH_LEN HASH_LEN + SALT_LEN
+#define AUTH_PK_LEN crypto_sign_PUBLICKEYBYTES
+#define AUTH_SK_LEN crypto_sign_SECRETKEYBYTES
+#define TOKEN_LEN HASH_LEN
+#define CHALLENGE_LEN HASH_LEN
+#define SIGNATURE_LEN crypto_sign_BYTES
+#define RK_LEN AES_KEY_LEN
 
 // copied from client-side; only magic, version, hash, and timestamp are really used
 typedef struct __attribute__((packed)) VaultHeader {
     char     magic[6];
     uint32_t version;
-    uint8_t  hash[V_HASH_LEN];
+    uint8_t  hash[HASH_LEN];
     uint64_t timestamp;
     uint32_t num_entries;
     uint32_t ciphertext_len;
-    uint8_t  salt[V_SALT_LEN]; // stored here as well as in Account struct to support exports/imports
-    uint8_t  nonce[V_NONCE_LEN];
-    uint8_t  tag[V_TAG_LEN];
+    uint8_t  salt[SALT_LEN]; // stored here as well as in Account struct to support exports/imports
+    uint8_t  nonce[NONCE_LEN];
+    uint8_t  tag[TAG_LEN];
 } VaultHeader;
 
 static uint64_t hex_to_u64(const char *hex) {

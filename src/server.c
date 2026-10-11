@@ -229,15 +229,6 @@ static cJSON *server_error(int code, char *message) {
 #define TOKEN_FILE_MAGIC "PWMTOK"
 #define TOKEN_FILE_VERSION 1
 
-#define HASH_LEN 32
-#define SALT_LEN crypto_pwhash_SALTBYTES
-#define UNAME_HASH_LEN HASH_LEN
-#define PASSWD_HASH_LEN HASH_LEN + SALT_LEN
-#define AUTH_PK_LEN crypto_sign_PUBLICKEYBYTES
-#define TOKEN_LEN HASH_LEN
-#define CHALLENGE_LEN HASH_LEN
-#define SIGNATURE_LEN crypto_sign_BYTES
-
 typedef enum ExpectedData {
     D_NONE,
     D_CA_EMAIL_VERIFICATION_CODE,
@@ -258,6 +249,7 @@ typedef struct __attribute__((packed)) ServerAccount {
     uint8_t  uname_hash[UNAME_HASH_LEN];
     uint8_t  passwd_hash[PASSWD_HASH_LEN];
     uint8_t  auth_pk[AUTH_PK_LEN];
+    uint8_t  recovery_key[RK_LEN];
     uint8_t  salt[SALT_LEN];
     uint64_t auth_seed_id;
     int64_t  last_modified;
@@ -804,14 +796,15 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
     cJSON *password_hash_obj  = cJSON_GetObjectItem(request, "password_hash");
     cJSON *auth_pk_obj        = cJSON_GetObjectItem(request, "auth_pk");
     cJSON *auth_seed_id_obj   = cJSON_GetObjectItem(request, "auth_seed_id");
+    cJSON *recovery_key_obj   = cJSON_GetObjectItem(request, "recovery_key");
     cJSON *salt_obj           = cJSON_GetObjectItem(request, "salt");
 
     int email_ok  = email_obj && cJSON_IsString(email_obj);
     int resend_ok = request_resend_obj && cJSON_IsBool(request_resend_obj);
     int data_ok = username_hash_obj && cJSON_IsString(username_hash_obj) && password_hash_obj &&
                   cJSON_IsString(password_hash_obj) && auth_pk_obj && cJSON_IsString(auth_pk_obj) && auth_seed_id_obj &&
-                  cJSON_IsString(auth_seed_id_obj) && strlen(auth_seed_id_obj->valuestring) == 16 && salt_obj &&
-                  cJSON_IsString(salt_obj);
+                  cJSON_IsString(auth_seed_id_obj) && strlen(auth_seed_id_obj->valuestring) == 16 && recovery_key_obj &&
+                  cJSON_IsString(recovery_key_obj) && salt_obj && cJSON_IsString(salt_obj);
 
     if (!email_ok || !(resend_ok ^ data_ok)) {
         return server_error(
@@ -826,6 +819,7 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
     uint8_t *password_hash = NULL;
     uint8_t *auth_pk       = NULL;
     uint64_t auth_seed_id  = 0;
+    uint8_t *recovery_key  = NULL;
     uint8_t *salt          = NULL;
 
     if (request_resend_obj && request_resend_obj->type == cJSON_True) {
@@ -840,20 +834,24 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
     int uname_hash_len;
     int passwd_hash_len;
     int auth_pk_len;
+    int rk_len;
     int salt_len;
 
     username_hash = b64_decode(cJSON_GetStringValue(username_hash_obj), &uname_hash_len);
     password_hash = b64_decode(cJSON_GetStringValue(password_hash_obj), &passwd_hash_len);
     auth_pk       = b64_decode(cJSON_GetStringValue(auth_pk_obj), &auth_pk_len);
+    recovery_key  = b64_decode(cJSON_GetStringValue(recovery_key_obj), &rk_len);
     salt          = b64_decode(cJSON_GetStringValue(salt_obj), &salt_len);
 
-    if (!username_hash || !password_hash || !auth_pk || auth_seed_id < 2 || !salt) {
+    if (!username_hash || !password_hash || !auth_pk || !recovery_key || !salt) {
         if (username_hash)
             free(username_hash);
         if (password_hash)
             free(password_hash);
         if (auth_pk)
             free(auth_pk);
+        if (recovery_key)
+            free(recovery_key);
         if (salt)
             free(salt);
 
@@ -861,18 +859,20 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
     }
 
     if (uname_hash_len != UNAME_HASH_LEN || passwd_hash_len != PASSWD_HASH_LEN || auth_pk_len != AUTH_PK_LEN ||
-        auth_seed_id < 2 || salt_len != SALT_LEN) {
+        auth_seed_id < 2 || rk_len != RK_LEN || salt_len != SALT_LEN) {
 
         free(username_hash);
         free(password_hash);
         free(auth_pk);
+        free(recovery_key);
         free(salt);
 
-        char err_msg[200];
+        char err_msg[250];
         sprintf(err_msg,
                 "Invalid length for one or more base64 fields, or invalid auth_seed_id! (expected uname_hash_len == "
-                "%d, passwd_hash_len == %d, auth_pk_len == %d, auth_seed_id < 2, and salt_len == %d)",
-                UNAME_HASH_LEN, PASSWD_HASH_LEN, AUTH_PK_LEN, SALT_LEN);
+                "%d, passwd_hash_len == %d, auth_pk_len == %d, auth_seed_id > 1, recovery_key_len == %d, and salt_len "
+                "== %d)",
+                UNAME_HASH_LEN, PASSWD_HASH_LEN, AUTH_PK_LEN, RK_LEN, SALT_LEN);
         return server_error(E_BADREQ, err_msg);
     }
 
@@ -885,6 +885,7 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
             free(username_hash);
             free(password_hash);
             free(auth_pk);
+            free(recovery_key);
             free(salt);
 
             return server_error(E_DUPEVAL, "Provided email already exists in accounts database!");
@@ -901,6 +902,7 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
         free(username_hash);
         free(password_hash);
         free(auth_pk);
+        free(recovery_key);
         free(salt);
 
         return server_error(E_INTERNALERR, "Failed to convert email to wchar to validate!");
@@ -912,6 +914,7 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
         free(username_hash);
         free(password_hash);
         free(auth_pk);
+        free(recovery_key);
         free(salt);
 
         char lib_vld_msg[256];
@@ -988,6 +991,7 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
             memcpy(verification_codes[code_idx].new_acc->uname_hash, username_hash, UNAME_HASH_LEN);
             memcpy(verification_codes[code_idx].new_acc->passwd_hash, password_hash, PASSWD_HASH_LEN);
             memcpy(verification_codes[code_idx].new_acc->auth_pk, auth_pk, AUTH_PK_LEN);
+            memcpy(verification_codes[code_idx].new_acc->recovery_key, recovery_key, RK_LEN);
             memcpy(verification_codes[code_idx].new_acc->salt, salt, SALT_LEN);
             verification_codes[code_idx].new_acc->auth_seed_id  = auth_seed_id;
             verification_codes[code_idx].new_acc->last_modified = time(NULL);
@@ -997,6 +1001,7 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
             free(username_hash);
             free(password_hash);
             free(auth_pk);
+            free(recovery_key);
             free(salt);
 
             code = gen_verification_code();
@@ -1042,6 +1047,7 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
         memcpy(new_acc->uname_hash, username_hash, UNAME_HASH_LEN);
         memcpy(new_acc->passwd_hash, password_hash, PASSWD_HASH_LEN);
         memcpy(new_acc->auth_pk, auth_pk, AUTH_PK_LEN);
+        memcpy(new_acc->recovery_key, recovery_key, RK_LEN);
         memcpy(new_acc->salt, salt, SALT_LEN);
         new_acc->last_modified = time(NULL);
         new_acc->auth_seed_id  = auth_seed_id;
@@ -1051,6 +1057,7 @@ static cJSON *run_create_account(cJSON *request, ThreadData *tdata) {
         free(username_hash);
         free(password_hash);
         free(auth_pk);
+        free(recovery_key);
         free(salt);
 
         return finish_create_account(email, -1, new_acc); // -1 = no code required
@@ -1163,10 +1170,11 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
     cJSON *new_password_hash_obj = cJSON_GetObjectItem(request, "new_password_hash");
     cJSON *new_auth_pk_obj       = cJSON_GetObjectItem(request, "new_auth_pk");
     cJSON *new_auth_seed_id_obj  = cJSON_GetObjectItem(request, "new_auth_seed_id");
+    cJSON *new_recovery_key_obj  = cJSON_GetObjectItem(request, "new_recovery_key");
     cJSON *new_salt_obj          = cJSON_GetObjectItem(request, "new_salt");
 
-    int has_update_data =
-        (new_username_hash_obj || new_password_hash_obj || new_auth_pk_obj || new_auth_seed_id_obj || new_salt_obj);
+    int has_update_data = (new_username_hash_obj || new_password_hash_obj || new_auth_pk_obj || new_auth_seed_id_obj ||
+                           new_recovery_key_obj || new_salt_obj);
 
     if (request_resend_obj && !cJSON_IsBool(request_resend_obj))
         return server_error(E_BADREQ, "Invalid data type for request_resend! (expected bool)");
@@ -1216,6 +1224,7 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
 
     uint8_t *new_username_hash = NULL;
     uint8_t *new_password_hash = NULL;
+    uint8_t *new_rk            = NULL;
     uint8_t *new_salt          = NULL;
 
     if (new_username_hash_obj) {
@@ -1255,11 +1264,35 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
         }
     }
 
+    if (new_rk) {
+        if (!cJSON_IsString(new_recovery_key_obj)) {
+            free(new_auth_pk);
+            free(new_username_hash);
+            free(new_password_hash);
+            return server_error(E_BADREQ, "Invalid type for new_rk! (expected string)");
+        }
+
+        int rk_len;
+        new_rk = b64_decode(new_recovery_key_obj->valuestring, &rk_len);
+
+        if (!new_rk || rk_len != RK_LEN) {
+            if (new_rk)
+                free(new_rk);
+            free(new_auth_pk);
+            if (new_username_hash)
+                free(new_username_hash);
+            if (new_password_hash)
+                free(new_password_hash);
+            return server_error(E_INTERNALERR, "Failed to decode base64 new_rk/invalid length");
+        }
+    }
+
     if (new_salt) {
         if (!cJSON_IsString(new_salt_obj)) {
             free(new_auth_pk);
             free(new_username_hash);
             free(new_password_hash);
+            free(new_rk);
             return server_error(E_BADREQ, "Invalid type for new_salt! (expected string)");
         }
 
@@ -1274,6 +1307,8 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
                 free(new_username_hash);
             if (new_password_hash)
                 free(new_password_hash);
+            if (new_rk)
+                free(new_rk);
             return server_error(E_INTERNALERR, "Failed to decode base64 new_salt/invalid length");
         }
     }
@@ -1298,6 +1333,8 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
             free(new_username_hash);
         if (new_password_hash)
             free(new_password_hash);
+        if (new_rk)
+            free(new_rk);
         free(new_auth_pk);
         return server_error(E_NOACCOUNT, "Failed to retrieve account from uid! Please try again");
     }
@@ -1324,6 +1361,10 @@ static cJSON *run_update_account(cJSON *request, ThreadData *tdata) {
     if (new_password_hash) {
         memcpy(new_acc->passwd_hash, new_password_hash, PASSWD_HASH_LEN);
         free(new_password_hash);
+    }
+    if (new_rk) {
+        memcpy(new_acc->recovery_key, new_rk, RK_LEN);
+        free(new_rk);
     }
     if (new_salt) {
         memcpy(new_acc->salt, new_salt, SALT_LEN);
@@ -1908,6 +1949,7 @@ static cJSON *run_get_account_info(cJSON *request) {
     int64_t  last_modified = 0;
     uint64_t auth_seed_id  = 0;
     uint8_t  salt[SALT_LEN];
+    uint8_t  rk[RK_LEN];
 
     pthread_mutex_lock(&accounts_lock);
 
@@ -1916,6 +1958,7 @@ static cJSON *run_get_account_info(cJSON *request) {
             last_modified = accounts[i].last_modified;
             auth_seed_id  = accounts[i].auth_seed_id;
             memcpy(salt, accounts[i].salt, SALT_LEN);
+            memcpy(rk, accounts[i].recovery_key, RK_LEN);
             break;
         }
     }
@@ -1934,6 +1977,11 @@ static cJSON *run_get_account_info(cJSON *request) {
     char *salt_b64 = b64_encode(salt, SALT_LEN);
     if (!salt_b64)
         return server_error(E_INTERNALERR, "Failed to encode salt as base64! (OOM)");
+    char *rk_b64 = b64_encode(rk, RK_LEN);
+    if (!rk_b64) {
+        free(salt_b64);
+        return server_error(E_INTERNALERR, "Failed to encode recovery key as base64! (OOM)");
+    }
 
     // hex string because cJSON doesn't support uint64_t
     char auth_seed_id_str[17];
@@ -1946,8 +1994,10 @@ static cJSON *run_get_account_info(cJSON *request) {
     cJSON_AddNumberToObject(response, "code", RESPONSE_OK);
     cJSON_AddStringToObject(response, "auth_seed_id", auth_seed_id_str);
     cJSON_AddStringToObject(response, "salt", salt_b64);
+    cJSON_AddStringToObject(response, "recovery_key", rk_b64);
     cJSON_AddStringToObject(response, "last_modified", last_modified_str);
     free(salt_b64);
+    free(rk_b64);
     return response;
 }
 
@@ -2470,7 +2520,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             goto send_response;
 
         case D_UA_EMAIL_VERIFICATION_CODE:
-            if (request_len < 4 + TOKEN_LEN + (int)sizeof(uint32_t) + 3 * 2 + (int)sizeof(uint16_t) * 2) {
+            if (request_len < 4 + (int)TOKEN_LEN + (int)sizeof(uint32_t) + 3 * 2 + (int)sizeof(uint16_t) * 2) {
                 response_j =
                     server_error(E_INVALIDDATA, "Invalid data length for verification code! (expected \"DATA\" + token "
                                                 "+ uint32_t + uint16_t + new email + uint16_t + old email)");
@@ -2481,21 +2531,21 @@ static int handle_request(char *request, int request_len, char *response_buf, si
 
             uint16_t ua_veri_email_len = *(uint16_t *)(request + 4 + TOKEN_LEN + sizeof(uint32_t));
             if (request_len <
-                4 + TOKEN_LEN + (int)sizeof(uint32_t) + (int)sizeof(uint16_t) * 2 + ua_veri_email_len + 3) {
+                4 + (int)TOKEN_LEN + (int)sizeof(uint32_t) + (int)sizeof(uint16_t) * 2 + ua_veri_email_len + 3) {
                 response_j = server_error(E_INVALIDDATA,
                                           "Invalid data length for verification ua_code! (expected \"DATA\" + token "
                                           "+ uint32_t + uint16_t + new email + uint16_t + old email)");
                 goto send_response;
             }
             char *ua_veri_email = ec_malloc(ua_veri_email_len + 1);
-            memcpy(ua_veri_email, (char *)(request + 4 + TOKEN_LEN + sizeof(uint32_t) + sizeof(uint16_t)),
+            memcpy(ua_veri_email, (char *)(request + 4 + (int)TOKEN_LEN + sizeof(uint32_t) + sizeof(uint16_t)),
                    ua_veri_email_len);
             ua_veri_email[ua_veri_email_len] = 0;
 
             uint16_t ua_old_email_len =
-                *(uint16_t *)(request + 4 + TOKEN_LEN + sizeof(uint32_t) + sizeof(uint16_t) + ua_veri_email_len);
-            if (request_len < 4 + TOKEN_LEN + (int)sizeof(uint32_t) + (int)sizeof(uint16_t) * 2 + ua_veri_email_len +
-                                  ua_old_email_len) {
+                *(uint16_t *)(request + 4 + (int)TOKEN_LEN + sizeof(uint32_t) + sizeof(uint16_t) + ua_veri_email_len);
+            if (request_len < 4 + (int)TOKEN_LEN + (int)sizeof(uint32_t) + (int)sizeof(uint16_t) * 2 +
+                                  ua_veri_email_len + ua_old_email_len) {
                 free(ua_veri_email);
                 response_j =
                     server_error(E_INVALIDDATA, "Invalid data length for verification code! (expected \"DATA\" + token "
@@ -2547,7 +2597,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
 
         case D_PWMNGR_FILE_TRANSFER:
 
-            if (request_len < (int)strlen("DATA") + TOKEN_LEN + (int)sizeof(uint16_t) + 3 + (int)sizeof(uint16_t)) {
+            if (request_len < (int)(strlen("DATA") + TOKEN_LEN + sizeof(uint16_t) + 3 + sizeof(uint16_t))) {
                 response_j = server_error(
                     E_INVALIDDATA,
                     "Invalid pwmngr file data! (expected \"DATA\" + token + uint16_t + email + uint16_t + fdata)");
@@ -2557,7 +2607,7 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             uint16_t file_email_len = *(uint16_t *)(request + 4 + TOKEN_LEN);
 
             if (request_len <
-                (int)strlen("DATA") + TOKEN_LEN + (int)sizeof(uint16_t) + file_email_len + (int)sizeof(uint16_t)) {
+                (int)(strlen("DATA") + TOKEN_LEN + sizeof(uint16_t) + file_email_len + sizeof(uint16_t))) {
                 response_j = server_error(
                     E_INVALIDDATA,
                     "Invalid pwmngr file data! (expected \"DATA\" + token + uint16_t + email + uint16_t + fdata)");
@@ -2568,8 +2618,8 @@ static int handle_request(char *request, int request_len, char *response_buf, si
             file_email[file_email_len] = 0;
 
             uint16_t data_len = *(uint16_t *)(request + 4 + TOKEN_LEN + sizeof(uint16_t) + file_email_len);
-            if (request_len < (int)strlen("DATA") + TOKEN_LEN + (int)sizeof(uint16_t) + file_email_len +
-                                  (int)sizeof(uint16_t) + data_len) {
+            if (request_len <
+                (int)(strlen("DATA") + TOKEN_LEN + sizeof(uint16_t) + file_email_len + sizeof(uint16_t) + data_len)) {
                 free(file_email);
                 response_j = server_error(
                     E_INVALIDDATA,

@@ -234,14 +234,6 @@ int send_packet(uint8_t *data, int data_len, uint8_t *response_buf, int response
     return received;
 }
 
-#define HASH_LEN 32
-#define UNAME_HASH_LEN 32
-#define PASSWD_HASH_LEN 48
-#define AUTH_PK_LEN 32
-#define SALT_LEN crypto_pwhash_SALTBYTES
-
-#define TOKEN_LEN 32
-
 // returns server version string
 char *remote_get_server_info() {
     char *get_info_req = "GETSERVERINFO";
@@ -290,10 +282,10 @@ char *remote_get_server_info() {
     return ret;
 }
 
-int remote_create_account(char *email, uint8_t *username_hash, uint8_t *password_hash, uint8_t *auth_pk, uint8_t *salt,
-                          uint64_t auth_seed_id, char **token_out) {
+int remote_create_account(char *email, uint8_t *username_hash, uint8_t *password_hash, uint8_t *auth_pk, uint8_t *rk,
+                          uint8_t *salt, uint64_t auth_seed_id, char **token_out) {
 
-    if (!email || !username_hash || !password_hash || !auth_pk || !salt || auth_seed_id < 2) {
+    if (!email || !username_hash || !password_hash || !auth_pk || !salt || auth_seed_id < 2 || !rk) {
         printf("Invalid arguments passed to remote_create_account!\n");
         return -1;
     }
@@ -306,18 +298,33 @@ int remote_create_account(char *email, uint8_t *username_hash, uint8_t *password
 
     char *password_hash_b64 = b64_encode(password_hash, PASSWD_HASH_LEN);
     if (!password_hash_b64) {
+        free(username_hash_b64);
         printf("Failed to encode password_hash as base64 string!\n");
         return -2;
     }
 
     char *auth_pk_b64 = b64_encode(auth_pk, AUTH_PK_LEN);
     if (!auth_pk_b64) {
+        free(username_hash_b64);
+        free(password_hash_b64);
         printf("Failed to encode auth_pk as base64 string!\n");
         return -2;
     }
 
+    char *rk_b64 = b64_encode(rk, RK_LEN);
+    if (!rk_b64) {
+        free(username_hash_b64);
+        free(password_hash_b64);
+        free(auth_pk_b64);
+        printf("Failed to encode recovery key as base64!\n");
+    }
+
     char *salt_b64 = b64_encode(salt, SALT_LEN);
     if (!salt_b64) {
+        free(username_hash_b64);
+        free(password_hash_b64);
+        free(auth_pk_b64);
+        free(rk_b64);
         printf("Failed to encode salt as base64 string!\n");
         return -2;
     }
@@ -332,11 +339,13 @@ int remote_create_account(char *email, uint8_t *username_hash, uint8_t *password
     cJSON_AddStringToObject(root, "password_hash", password_hash_b64);
     cJSON_AddStringToObject(root, "auth_pk", auth_pk_b64);
     cJSON_AddStringToObject(root, "auth_seed_id", auth_seed_id_str);
+    cJSON_AddStringToObject(root, "recovery_key", rk_b64);
     cJSON_AddStringToObject(root, "salt", salt_b64);
 
     free(username_hash_b64);
     free(password_hash_b64);
     free(auth_pk_b64);
+    free(rk_b64);
     free(salt_b64);
 
     char    *request_j    = cJSON_PrintUnformatted(root);
@@ -377,7 +386,8 @@ int remote_create_account(char *email, uint8_t *username_hash, uint8_t *password
 }
 
 int remote_update_account(char *current_email, char *token_b64, char *email, uint8_t *username_hash,
-                          uint8_t *password_hash, uint8_t *auth_pk, uint8_t *salt, uint64_t auth_seed_id) {
+                          uint8_t *password_hash, uint8_t *auth_pk, uint8_t *recovery_key, uint8_t *salt,
+                          uint64_t auth_seed_id) {
 
     if (!current_email || !token_b64 || !auth_pk || auth_seed_id < 2) {
         printf("Invalid arguments passed to remote_update_account!\n");
@@ -392,18 +402,42 @@ int remote_update_account(char *current_email, char *token_b64, char *email, uin
 
     char *password_hash_b64 = b64_encode(password_hash, PASSWD_HASH_LEN);
     if (password_hash && !password_hash_b64) {
+        if (username_hash_b64)
+            free(username_hash_b64);
         printf("Failed to encode password_hash as base64 string!\n");
         return -2;
     }
 
     char *auth_pk_b64 = b64_encode(auth_pk, AUTH_PK_LEN);
     if (!auth_pk_b64) {
+        if (username_hash_b64)
+            free(username_hash_b64);
+        if (password_hash_b64)
+            free(password_hash_b64);
         printf("Failed to encode auth_pk as base64 string!\n");
+        return -2;
+    }
+
+    char *rk_b64 = b64_encode(recovery_key, RK_LEN);
+    if (recovery_key && !rk_b64) {
+        if (username_hash_b64)
+            free(username_hash_b64);
+        if (password_hash_b64)
+            free(password_hash_b64);
+        free(auth_pk_b64);
+        printf("Failed to encode recovery key as base64 string!\n");
         return -2;
     }
 
     char *salt_b64 = b64_encode(salt, SALT_LEN);
     if (salt && !salt_b64) {
+        if (username_hash_b64)
+            free(username_hash_b64);
+        if (password_hash_b64)
+            free(password_hash_b64);
+        free(auth_pk_b64);
+        if (recovery_key)
+            free(rk_b64);
         printf("Failed to encode salt as base64 string!\n");
         return -2;
     }
@@ -423,12 +457,20 @@ int remote_update_account(char *current_email, char *token_b64, char *email, uin
         cJSON_AddStringToObject(root, "new_password_hash", password_hash_b64);
     cJSON_AddStringToObject(root, "new_auth_pk", auth_pk_b64);
     cJSON_AddStringToObject(root, "new_auth_seed_id", auth_seed_id_str);
+    if (recovery_key)
+        cJSON_AddStringToObject(root, "new_recovery_key", rk_b64);
     if (salt)
         cJSON_AddStringToObject(root, "new_salt", salt_b64);
 
-    free(username_hash_b64);
-    free(password_hash_b64);
+    if (username_hash_b64)
+        free(username_hash_b64);
+    if (password_hash_b64)
+        free(password_hash_b64);
     free(auth_pk_b64);
+    if (rk_b64)
+        free(rk_b64);
+    if (salt)
+        free(salt);
 
     char    *request_j    = cJSON_PrintUnformatted(root);
     uint8_t *request_data = ec_malloc(strlen("REQUEST") + strlen(request_j) + 1);
@@ -627,13 +669,6 @@ int finish_update_account(int verification_code, char *email, char *old_email, c
     return code_check_res;
 }
 
-#define KEY_LEN crypto_secretbox_KEYBYTES
-#define PK_LEN crypto_sign_PUBLICKEYBYTES
-#define SK_LEN crypto_sign_SECRETKEYBYTES
-
-#define CHALLENGE_LEN 32
-#define SIGNATURE_LEN crypto_sign_BYTES
-
 int remote_auth(char *email, uint8_t *auth_sk, char **token_out) {
 
     if (!email || !strlen(email) || !auth_sk) {
@@ -784,7 +819,8 @@ int remote_invalidate_tokens(char *email, char *token_b64) {
     return check_response_code(req_response_j);
 }
 
-int remote_get_account_info(char *email, time_t *last_known_timestamp, uint8_t **salt, uint64_t *auth_seed_id) {
+int remote_get_account_info(char *email, time_t *last_known_timestamp, uint8_t **salt, uint64_t *auth_seed_id,
+                            uint8_t **rk) {
 
     if (!email) {
         printf("Missing email!\n");
@@ -824,16 +860,19 @@ int remote_get_account_info(char *email, time_t *last_known_timestamp, uint8_t *
 
     char *auth_seed_id_str  = NULL;
     char *salt_b64          = NULL;
+    char *rk_b64            = NULL;
     char *last_modified_str = NULL;
 
     int code_check_res = check_response_code(response_root);
     if (!code_check_res) {
+
         cJSON *auth_seed_id_obj = cJSON_GetObjectItem(response_root, "auth_seed_id");
         cJSON *salt_obj         = cJSON_GetObjectItem(response_root, "salt");
+        cJSON *rk_obj           = cJSON_GetObjectItem(response_root, "recovery_key");
         cJSON *timestamp_obj    = cJSON_GetObjectItem(response_root, "last_modified");
 
-        if (!auth_seed_id_obj || !salt_obj || !timestamp_obj || !cJSON_IsString(auth_seed_id_obj) ||
-            !cJSON_IsString(salt_obj) || !cJSON_IsString(timestamp_obj) ||
+        if (!auth_seed_id_obj || !salt_obj || !rk_obj || !timestamp_obj || !cJSON_IsString(auth_seed_id_obj) ||
+            !cJSON_IsString(salt_obj) || !cJSON_IsString(rk_obj) || !cJSON_IsString(timestamp_obj) ||
             strlen(auth_seed_id_obj->valuestring) != 16 || strlen(timestamp_obj->valuestring) != 16) {
             printf("Missing/invalid server response fields!\n");
             cJSON_Delete(response_root);
@@ -841,8 +880,11 @@ int remote_get_account_info(char *email, time_t *last_known_timestamp, uint8_t *
         }
 
         auth_seed_id_str  = strdup(auth_seed_id_obj->valuestring);
+        rk_b64            = strdup(rk_obj->valuestring);
         salt_b64          = strdup(salt_obj->valuestring);
         last_modified_str = strdup(timestamp_obj->valuestring);
+        cJSON_Delete(response_root);
+
     } else if (code_check_res == E_CLIENTUPTODATE) {
         cJSON_Delete(response_root);
         return code_check_res;
@@ -861,10 +903,25 @@ int remote_get_account_info(char *email, time_t *last_known_timestamp, uint8_t *
     *salt = b64_decode(salt_b64, &salt_len);
     free(salt_b64);
 
-    if (!salt || salt_len != SALT_LEN) {
+    int rk_len;
+    *rk = b64_decode(rk_b64, &rk_len);
+    free(rk_b64);
+
+    if (!*salt || salt_len != SALT_LEN) {
         if (*salt)
             free(*salt);
+        if (*rk)
+            free(*rk);
         printf("Invalid salt length!\n");
+        return -5;
+    }
+
+    if (!*rk || rk_len != RK_LEN) {
+        free(*salt);
+        *salt = NULL;
+        if (*rk)
+            free(*rk);
+        printf("Invalid recovery key length!\n");
         return -5;
     }
 
@@ -987,7 +1044,7 @@ int remote_import_account(char *email, char *token_b64, time_t *last_known_times
     *auth_pk = b64_decode(auth_pk_b64, &auth_pk_len);
     free(auth_pk_b64);
 
-    if (!*auth_pk || auth_pk_len != PK_LEN) {
+    if (!*auth_pk || auth_pk_len != AUTH_PK_LEN) {
         free(*uname_hash);
         free(*passwd_hash);
         if (*auth_pk)
@@ -1413,7 +1470,7 @@ int passwd_to_keys_with_salt(const char *password, uint8_t *salt, uint64_t auth_
 
     uint8_t auth_seed[crypto_sign_SEEDBYTES];
 
-    crypto_kdf_derive_from_key(vault_key, KEY_LEN, 1, "vault-key", mkey);
+    crypto_kdf_derive_from_key(vault_key, AES_KEY_LEN, 1, "vault-key", mkey);
     crypto_kdf_derive_from_key(auth_seed, sizeof(auth_seed), auth_seed_id, "auth-seed", mkey);
 
     crypto_sign_seed_keypair(auth_pk, auth_sk, auth_seed);
@@ -1544,20 +1601,22 @@ int main() {
             uint8_t  salt[SALT_LEN];
             uint8_t  username_hash[UNAME_HASH_LEN];
             uint8_t  password_hash[PASSWD_HASH_LEN];
-            uint8_t  vault_key[KEY_LEN];
-            uint8_t  auth_pk[PK_LEN];
-            uint8_t  auth_sk[SK_LEN];
+            uint8_t  vault_key[AES_KEY_LEN];
+            uint8_t  auth_pk[AUTH_PK_LEN];
+            uint8_t  auth_sk[AUTH_SK_LEN];
             uint64_t auth_seed_id;
+            uint8_t  rk[RK_LEN];
 
             char *token_b64 = NULL;
 
             randombytes_buf(username_hash, sizeof(username_hash));
             randombytes_buf(password_hash, sizeof(password_hash));
+            randombytes_buf(rk, sizeof(rk));
 
             passwd_to_keys_new(new_password, &auth_seed_id, salt, vault_key, auth_pk, auth_sk);
 
             int res =
-                remote_create_account(email, username_hash, password_hash, auth_pk, salt, auth_seed_id, &token_b64);
+                remote_create_account(email, username_hash, password_hash, auth_pk, rk, salt, auth_seed_id, &token_b64);
 
             if (!res) {
                 printf("Successfully created new account!\nToken: %s\n", token_b64);
@@ -1581,10 +1640,11 @@ int main() {
             uint8_t  new_password_hash[PASSWD_HASH_LEN] = {0};
             uint8_t  new_username_hash[UNAME_HASH_LEN]  = {0};
             uint8_t  salt[SALT_LEN];
-            uint8_t  auth_sk[SK_LEN];
-            uint8_t  vault_key[KEY_LEN];
-            uint8_t  new_auth_pk[PK_LEN];
+            uint8_t  auth_sk[AUTH_SK_LEN];
+            uint8_t  vault_key[AES_KEY_LEN];
+            uint8_t  new_auth_pk[AUTH_PK_LEN];
             uint64_t new_auth_seed_id;
+            uint8_t  new_rk[RK_LEN] = {0};
 
             randombytes_buf(&new_auth_seed_id, sizeof(new_auth_seed_id));
             passwd_to_keys_new(cmd_tokens[2], &new_auth_seed_id, salt, vault_key, new_auth_pk, auth_sk);
@@ -1597,6 +1657,8 @@ int main() {
                         randombytes_buf(new_username_hash, sizeof(new_username_hash));
                     else if (!strcmp(cmd_tokens[5], "--passwd"))
                         randombytes_buf(new_password_hash, sizeof(new_password_hash));
+                    else if (!strcmp(cmd_tokens[5], "--rk"))
+                        randombytes_buf(new_rk, sizeof(new_rk));
                 }
 
                 if (cmd_tokens[6]) {
@@ -1604,6 +1666,17 @@ int main() {
                         randombytes_buf(new_username_hash, sizeof(new_username_hash));
                     else if (!strcmp(cmd_tokens[6], "--passwd"))
                         randombytes_buf(new_password_hash, sizeof(new_password_hash));
+                    else if (!strcmp(cmd_tokens[6], "--rk"))
+                        randombytes_buf(new_rk, sizeof(new_rk));
+                }
+
+                if (cmd_tokens[7]) {
+                    if (!strcmp(cmd_tokens[7], "--uname"))
+                        randombytes_buf(new_username_hash, sizeof(new_username_hash));
+                    else if (!strcmp(cmd_tokens[7], "--passwd"))
+                        randombytes_buf(new_password_hash, sizeof(new_password_hash));
+                    else if (!strcmp(cmd_tokens[7], "--rk"))
+                        randombytes_buf(new_rk, sizeof(new_rk));
                 }
             } else {
                 if (cmd_tokens[4]) {
@@ -1611,6 +1684,8 @@ int main() {
                         randombytes_buf(new_username_hash, sizeof(new_username_hash));
                     else if (!strcmp(cmd_tokens[4], "--passwd"))
                         randombytes_buf(new_password_hash, sizeof(new_password_hash));
+                    else if (!strcmp(cmd_tokens[4], "--rk"))
+                        randombytes_buf(new_rk, sizeof(new_rk));
                 }
 
                 if (cmd_tokens[5]) {
@@ -1618,12 +1693,24 @@ int main() {
                         randombytes_buf(new_username_hash, sizeof(new_username_hash));
                     else if (!strcmp(cmd_tokens[5], "--passwd"))
                         randombytes_buf(new_password_hash, sizeof(new_password_hash));
+                    else if (!strcmp(cmd_tokens[5], "--rk"))
+                        randombytes_buf(new_rk, sizeof(new_rk));
+                }
+
+                if (cmd_tokens[6]) {
+                    if (!strcmp(cmd_tokens[6], "--uname"))
+                        randombytes_buf(new_username_hash, sizeof(new_username_hash));
+                    else if (!strcmp(cmd_tokens[6], "--passwd"))
+                        randombytes_buf(new_password_hash, sizeof(new_password_hash));
+                    else if (!strcmp(cmd_tokens[6], "--rk"))
+                        randombytes_buf(new_rk, sizeof(new_rk));
                 }
             }
 
-            int res = remote_update_account(
-                cmd_tokens[1], cmd_tokens[3], new_email, new_username_hash[0] ? new_username_hash : NULL,
-                new_password_hash[0] ? new_password_hash : NULL, new_auth_pk, salt, new_auth_seed_id);
+            int res = remote_update_account(cmd_tokens[1], cmd_tokens[3], new_email,
+                                            new_username_hash[0] ? new_username_hash : NULL,
+                                            new_password_hash[0] ? new_password_hash : NULL, new_auth_pk,
+                                            new_rk[0] ? new_rk : NULL, salt, new_auth_seed_id);
 
             if (!res) {
                 printf("Successfully updated account!\n");
@@ -1646,19 +1733,24 @@ int main() {
                 timestamp = strtol(cmd_tokens[2], NULL, 16);
 
             char    *salt_b64     = NULL;
+            char    *rk_b64       = NULL;
             uint8_t *salt         = NULL;
             uint64_t auth_seed_id = 0;
+            uint8_t *rk           = NULL;
 
-            int res = remote_get_account_info(cmd_tokens[1], &timestamp, &salt, &auth_seed_id);
+            int res = remote_get_account_info(cmd_tokens[1], &timestamp, &salt, &auth_seed_id, &rk);
 
             char auth_seed_id_str[17];
             u64_to_hex(auth_seed_id, auth_seed_id_str, sizeof(auth_seed_id_str));
 
             if (!res) {
                 salt_b64 = b64_encode(salt, SALT_LEN);
-                printf("Got salt %s, auth_seed_id %s\n", salt_b64, auth_seed_id_str);
+                rk_b64   = b64_encode(rk, RK_LEN);
+                printf("Got salt %s, auth_seed_id %s, recovery key %s\n", salt_b64, auth_seed_id_str, rk_b64);
                 free(salt);
+                free(rk);
                 free(salt_b64);
+                free(rk_b64);
                 goto cont_loop;
             }
 
@@ -1694,7 +1786,7 @@ int main() {
             char *uname_hash_b64  = b64_encode(uname_hash, UNAME_HASH_LEN);
             char *passwd_hash_b64 = b64_encode(passwd_hash, PASSWD_HASH_LEN);
             char *salt_b64        = b64_encode(salt, SALT_LEN);
-            char *auth_pk_b64     = b64_encode(auth_pk, PK_LEN);
+            char *auth_pk_b64     = b64_encode(auth_pk, AUTH_PK_LEN);
 
             char auth_seed_id_str[17];
             char timestamp_str[17];
@@ -1749,9 +1841,9 @@ int main() {
             uint8_t *salt         = b64_decode(cmd_tokens[3], NULL);
             uint64_t auth_seed_id = strtoul(cmd_tokens[4], NULL, 16);
 
-            uint8_t vault_key[KEY_LEN];
-            uint8_t auth_pk[PK_LEN];
-            uint8_t auth_sk[SK_LEN];
+            uint8_t vault_key[AES_KEY_LEN];
+            uint8_t auth_pk[AUTH_PK_LEN];
+            uint8_t auth_sk[AUTH_SK_LEN];
 
             passwd_to_keys_with_salt(cmd_tokens[2], salt, auth_seed_id, vault_key, auth_pk, auth_sk);
             free(salt);
